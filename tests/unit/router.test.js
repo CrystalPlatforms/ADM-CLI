@@ -84,24 +84,49 @@ describe('route — no-args behaviour', () => {
     expect(stderr).toContain('terminal');
   });
 
-  test('TTY prints the wizard-arrives-later notice and exits 0', () => {
+  test('TTY (no ADM_TOOLS) launches the wizard and exits with its code', async () => {
     const d = sink();
-    const code = route([], { ...d, tty: true });
+    const seen = [];
+    const code = await route([], {
+      ...d,
+      tty: true,
+      wizard: async (opts) => { seen.push(opts); return 0; },
+    });
     expect(code).toBe(0);
-    expect(d.calls.out.join('\n')).toContain('wizard arrives');
+    expect(seen).toHaveLength(1);
+    expect(seen[0].tty).toBe(true);
   });
 
-  test('ADM_TOOLS plans tools even without a TTY (exit 0)', () => {
-    const prev = process.env.ADM_TOOLS;
+  test('ADM_TOOLS + ADM_DRY_RUN=1 plans tools even without a TTY (exit 0)', () => {
+    const prevTools = process.env.ADM_TOOLS;
+    const prevDry = process.env.ADM_DRY_RUN;
     process.env.ADM_TOOLS = 'typescript';
+    process.env.ADM_DRY_RUN = '1';
     try {
       const d = sink();
       const code = route([], { ...d, tty: false });
       expect(code).toBe(0);
       expect(d.calls.out.join('\n')).toContain('typescript');
     } finally {
-      if (prev === undefined) delete process.env.ADM_TOOLS;
-      else process.env.ADM_TOOLS = prev;
+      if (prevTools === undefined) delete process.env.ADM_TOOLS; else process.env.ADM_TOOLS = prevTools;
+      if (prevDry === undefined) delete process.env.ADM_DRY_RUN; else process.env.ADM_DRY_RUN = prevDry;
+    }
+  });
+
+  test('ADM_TOOLS without ADM_DRY_RUN runs the real install path', async () => {
+    const prevTools = process.env.ADM_TOOLS;
+    const prevDry = process.env.ADM_DRY_RUN;
+    process.env.ADM_TOOLS = 'nonesuch';
+    delete process.env.ADM_DRY_RUN;
+    try {
+      const d = sink();
+      const code = await route([], { ...d, tty: false });
+      // unknown id → usage error before anything is executed
+      expect(code).toBe(1);
+      expect(d.calls.err.join('\n')).toContain('Unknown tool id');
+    } finally {
+      if (prevTools === undefined) delete process.env.ADM_TOOLS; else process.env.ADM_TOOLS = prevTools;
+      if (prevDry === undefined) delete process.env.ADM_DRY_RUN; else process.env.ADM_DRY_RUN = prevDry;
     }
   });
 });

@@ -126,6 +126,12 @@ describe('install planning (ADM_TOOLS)', () => {
     expect(r.stderr).toContain('Valid tool ids:');
     expect(r.stderr).toContain('typescript'); // valid set is enumerated
   });
+
+  test('unknown ADM_TOOLS id fails usage-fast even without ADM_DRY_RUN (nothing installed)', () => {
+    const r = runAdm([], { env: { ADM_TOOLS: 'nonesuch' }, stdin: 'pipe' });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('Unknown tool id');
+  });
 });
 
 describe('adm uninstall — idempotency through the full CLI', () => {

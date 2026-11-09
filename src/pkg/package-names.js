@@ -99,8 +99,20 @@ const PACKAGE_NAMES = {
   'clang-tidy': { dnf: 'clang-tools-extra', pacman: 'clang', zypper: 'clang', apk: 'clang' },
 
   // ── universal ─────────────────────────────────────────────────
+  // Windows winget ids differ from the tool ids — explicit mapping below.
+  curl: { winget: 'cURL.cURL' },
+  jq: { winget: 'jqlang.jq' },
+  yq: { winget: 'MikeFarah.yq' },
+  // rsync is a Unix tool — no native Windows package exists anywhere
+  rsync: { winget: { manual: 'rsync is a Unix tool and has no native Windows build — use WSL: wsl -e rsync <args>, or try Rclone for cloud sync: winget install Rclone.Rclone' }, choco: { manual: 'rsync on Windows requires WSL/Cygwin — recommended: wsl -e rsync <args>' } },
+  // wget's winget manifest is permanently outdated (installer hash mismatch)
+  // and Windows 10+ ships curl anyway — route to manual guidance.
+  wget: { winget: { manual: 'the winget wget package is currently broken (installer hash mismatch). Windows 10+ already has curl built in: curl -O <url>. Or install wget via scoop: scoop install wget' } },
+  ffmpeg: { winget: 'Gyan.FFmpeg' },
+  watchman: { winget: 'facebook.watchman' },
+  tmux: { winget: { manual: 'tmux is a Unix terminal multiplexer and is not available on Windows — use WSL: wsl -e bash -c "sudo apt install tmux"' }, choco: { manual: 'tmux on Windows requires WSL/Cygwin — recommended: wsl -e bash -c "sudo apt install tmux"' } },
   gitflow: { dnf: { manual: 'gitflow is not in official Fedora repos — https://github.com/petervanderdoes/gitflow-avh/wiki/Installation' }, zypper: { manual: 'gitflow is not in openSUSE repos — https://github.com/petervanderdoes/gitflow-avh/wiki/Installation' }, apk: { manual: 'gitflow is not in Alpine repos — https://github.com/petervanderdoes/gitflow-avh/wiki/Installation' } },
-  lazydocker: { apt: { manual: 'download from https://github.com/jesseduffield/lazydocker/releases' }, dnf: { manual: 'download from https://github.com/jesseduffield/lazydocker/releases' }, zypper: { manual: 'download from https://github.com/jesseduffield/lazydocker/releases' }, apk: { manual: 'download from https://github.com/jesseduffield/lazydocker/releases' } },
+  lazydocker: { winget: 'JesseDuffield.Lazydocker', apt: { manual: 'download from https://github.com/jesseduffield/lazydocker/releases' }, dnf: { manual: 'download from https://github.com/jesseduffield/lazydocker/releases' }, zypper: { manual: 'download from https://github.com/jesseduffield/lazydocker/releases' }, apk: { manual: 'download from https://github.com/jesseduffield/lazydocker/releases' } },
   docker: {
     apt: 'docker.io',
     dnf: 'moby-engine',

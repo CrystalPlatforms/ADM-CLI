@@ -14,8 +14,8 @@ const COMMANDS = [
 
 const AUTOMATION_HINTS = [
   'Automation:',
-  '  ADM_TOOLS=<id,id> adm            print an install plan for the given tools (no prompts)',
-  '  ADM_DRY_RUN=1 ADM_TOOLS=<ids> adm   same as above, explicit dry run',
+  '  ADM_TOOLS=<id,id> adm               install the given tools (no prompts)',
+  '  ADM_DRY_RUN=1 ADM_TOOLS=<ids> adm   print the install plan only (no changes)',
   ...(process.platform === 'win32' ? [
     '  PowerShell:  $env:ADM_TOOLS="typescript,node"; adm   (then: $env:ADM_TOOLS=$null)',
   ] : []),

@@ -16,11 +16,25 @@ function cleanRcFile(rcPath) {
   } catch {
     return { cleaned: false, lines: 0 };
   }
-  const kept = content.split('\n').filter(line => !RC_MARKERS.some(m => line.includes(m)));
-  if (kept.length === content.split('\n').length) {
+  const lines = content.split('\n');
+  const kept = [];
+  let removed = 0;
+  for (let i = 0; i < lines.length; i++) {
+    if (RC_MARKERS.some(m => lines[i].includes(m))) {
+      removed++;
+      // The PATH line ADM appends right after its marker goes too —
+      // leave zero trace (v0.3 installer layout).
+      if (lines[i + 1] && /^\s*export\s+PATH=/.test(lines[i + 1])) {
+        i++;
+        removed++;
+      }
+      continue;
+    }
+    kept.push(lines[i]);
+  }
+  if (removed === 0) {
     return { cleaned: false, lines: 0 };
   }
-  const removed = content.split('\n').length - kept.length;
   fs.writeFileSync(rcPath, kept.join('\n'), 'utf8');
   return { cleaned: true, lines: removed };
 }

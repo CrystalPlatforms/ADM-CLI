@@ -65,10 +65,13 @@ const NVM_INSTALL = 'curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.
 
 // Pick the python installer command:
 //   pip available → pip / pip3 available → pip3 / otherwise → python3 -m pip
-function pipCommand(pkgName, availability = {}) {
+// On Windows the fallback MUST be `python -m pip`: python3.exe is commonly a
+// Microsoft Store alias stub that silently opens the Store (installs hang).
+function pipCommand(pkgName, availability = {}, os) {
   if (availability.pip) return `pip install --upgrade ${pkgName}`;
   if (availability.pip3) return `pip3 install --upgrade ${pkgName}`;
-  return `python3 -m pip install --upgrade ${pkgName}`;
+  const python = os === 'win32' ? 'python -m pip install --upgrade' : 'python3 -m pip install --upgrade';
+  return `${python} ${pkgName}`;
 }
 
 // Builds the install plan entry for one tool in one environment.
@@ -99,7 +102,7 @@ function buildToolPlan(tool, env, opts = {}) {
     case 'pip':
     case 'python': {
       const pkgName = id;
-      return planned({ command: pipCommand(pkgName, opts.pipAvailability) });
+      return planned({ command: pipCommand(pkgName, opts.pipAvailability, env.os) });
     }
 
     case 'cargo': {
@@ -133,16 +136,19 @@ function buildToolPlan(tool, env, opts = {}) {
 
     case 'rustup': {
       // rustup itself (the "cargo" catalog entry) and rustup components
-      if (id === 'cargo') return resolveScript('rustup', env.os, env.arch).url
-        ? { status: 'planned', command: resolveScript('rustup', env.os, env.arch).run, statusSource: 'command -v cargo' }
-        : { status: 'manual', reason: resolveScript('rustup', env.os, env.arch).manual };
+      if (id === 'cargo') {
+        const s = resolveScript('rustup', env.os, env.arch);
+        if (s.manual) return { status: 'manual', reason: s.manual };
+        return planned({ command: s.run, shell: s.shell, statusSource: 'command -v cargo' });
+      }
       return planned({ command: `rustup component add ${id}` });
     }
 
     case 'script': {
       const resolved = resolveScript(id, env.os, env.arch);
       if (resolved.manual) return { status: 'manual', reason: resolved.manual };
-      return planned({ command: resolved.run, package: resolved.url });
+      // `shell: 'powershell'` propagates to the executor (Windows-only scripts).
+      return planned({ command: resolved.run, package: resolved.url, shell: resolved.shell });
     }
 
     case 'link':

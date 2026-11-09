@@ -74,6 +74,14 @@ describe('pip fallback', () => {
     const plan = buildToolPlan({ id: 'poetry', installMethod: 'pip' }, ENVS.linux);
     expect(plan.command).toBe('python3 -m pip install --upgrade poetry');
   });
+
+  test('Windows fallback is python -m pip — python3.exe is a Store alias stub', () => {
+    expect(pipCommand('aider-chat', {}, 'win32')).toBe('python -m pip install --upgrade aider-chat');
+    // explicit availability still wins
+    expect(pipCommand('aider-chat', { pip: true }, 'win32')).toBe('pip install --upgrade aider-chat');
+    const plan = buildToolPlan({ id: 'aider-chat', installMethod: 'pip' }, ENVS.win);
+    expect(plan.command).toBe('python -m pip install --upgrade aider-chat');
+  });
 });
 
 describe('manual and missing-manager handling', () => {

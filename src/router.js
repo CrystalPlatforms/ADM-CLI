@@ -6,6 +6,8 @@ const { runConfig } = require('./commands/config');
 const { runUninstall } = require('./commands/uninstall');
 const { runDotfilesSync } = require('./commands/dotfiles');
 const { runPlan } = require('./install/plan');
+const { runInstall } = require('./install/run');
+const { runWizard } = require('./setup/wizard');
 const { legacyCleanup } = require('./legacy-cleanup');
 const { closestMatches } = require('./utils/closest-match');
 
@@ -36,14 +38,17 @@ function route(argv, deps = {}) {
 
   // ── adm (no args) ────────────────────────────────────────────
   if (argv.length === 0) {
-    // Non-interactive tool planning: ADM_TOOLS=<id,id>
+    // Non-interactive tool planning / real install: ADM_TOOLS=<id,id>
     if (process.env.ADM_TOOLS) {
-      return runPlan(process.env.ADM_TOOLS, { log, err });
+      if (process.env.ADM_DRY_RUN === '1') {
+        return runPlan(process.env.ADM_TOOLS, { log, err });
+      }
+      return runInstall(process.env.ADM_TOOLS, { log, err });
     }
     if (!tty) {
-      // Never hang: stdin is not a terminal and no wizard exists yet.
+      // Never hang: stdin is not a terminal — the wizard needs a TTY (#26 guard).
       const lines = [
-        'adm needs a terminal for interactive mode (wizard arrives in an upcoming version).',
+        'adm needs a terminal for interactive mode.',
         '',
         ...AUTOMATION_HINTS,
         '',
@@ -53,10 +58,8 @@ function route(argv, deps = {}) {
       err(lines.join('\n'));
       return 1;
     }
-    log('The interactive wizard arrives in an upcoming version.');
-    log('For now: run "adm help" to see commands, or use ADM_TOOLS for automation:');
-    for (const hint of AUTOMATION_HINTS.slice(1)) log(hint);
-    return 0;
+    // Interactive setup wizard (#30): categories → tools → install → git step.
+    return (deps.wizard || runWizard)({ log, err, tty });
   }
 
   const head = argv[0];

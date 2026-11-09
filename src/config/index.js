@@ -10,8 +10,8 @@ async function ensureConfigDir(dir) {
   await fs.mkdir(dir, { recursive: true });
 }
 
-async function readConfig() {
-  const dir = configDir();
+async function readConfig(dirOverride) {
+  const dir = dirOverride || configDir();
   const file = path.join(dir, 'config.json');
   try {
     const data = await fs.readFile(file, 'utf8');
@@ -22,8 +22,8 @@ async function readConfig() {
   }
 }
 
-async function writeConfig(obj) {
-  const dir = configDir();
+async function writeConfig(obj, dirOverride) {
+  const dir = dirOverride || configDir();
   await ensureConfigDir(dir);
   const file = path.join(dir, 'config.json');
   await fs.writeFile(file, JSON.stringify(obj, null, 2), 'utf8');
