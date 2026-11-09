@@ -1,26 +1,9 @@
 #!/usr/bin/env node
-const chalk = require('chalk');
-const { handleAdmError, formatError } = require('../src/utils/error-handler');
+const { main } = require('../src/router');
 
-const pkg = require('../package.json');
-const args = process.argv.slice(2);
-
-// ── adm -v / adm --version ──────────────────────────────────
-if (args[0] === '-v' || args[0] === '--version') {
-  console.log(pkg.version);
-  process.exit(0);
-}
-
-// ── adm (no args) → TUI ────────────────────────────────────
-if (args.length === 0) {
-  const { boot } = require('../src/tui/app');
-  boot().catch(err => {
-    console.error(chalk.red(err.message));
-    process.exit(1);
+main(process.argv.slice(2))
+  .then(code => process.exit(code))
+  .catch(e => {
+    process.stderr.write(`ADM failed: ${e && e.message ? e.message : e}\n`);
+    process.exit(2);
   });
-  return;
-}
-
-// ── unknown command ──────────────────────────────────────────
-console.error(chalk.red(`Unknown command: ${args[0]}. Run ${chalk.bold('adm --help')} for available commands.`));
-process.exit(1);

@@ -1,92 +1,69 @@
-/**
- * TDD — uninstall(): full removal (config + npm + binary)
- *
- * Assumptions:
- * - uninstall() removes ~/.adm config directory
- * - uninstall() runs `npm uninstall -g @crystalgames/adm` via child_process.spawn
- * - uninstall() attempts to remove /usr/local/bin/adm binary via fs.rm
- * - uninstall() cleans shell rc files (existing behavior)
- * - Errors in individual steps don't abort — best-effort removal
- * - Mock boundaries: fs.promises.rm, child_process.spawn
- * - NOT tested: actual npm execution, actual file deletion
- */
-describe('uninstall() — full removal', () => {
-  let mockRm;
-  let mockSpawn;
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { runUninstall } = require('../../../src/commands/uninstall');
 
-  beforeEach(() => {
-    jest.resetModules();
-    mockRm = jest.fn(() => Promise.resolve());
-    mockSpawn = jest.fn(() => ({
-      on: jest.fn((event, cb) => { if (event === 'close') cb(0); }),
-      stdout: { on: jest.fn() },
-      stderr: { on: jest.fn() },
-    }));
+function makeHomeFixture() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'adm-home-'));
+  return { home, logs: [], errs: [] };
+}
 
-    jest.doMock('fs', () => ({
-      promises: {
-        rm: mockRm,
-        readFile: jest.fn(() => Promise.resolve('')),
-        writeFile: jest.fn(() => Promise.resolve()),
-      },
-    }));
-    jest.doMock('child_process', () => ({ spawn: mockSpawn }));
-  });
+describe('runUninstall — idempotency contract', () => {
+  test('first run removes ~/.adm, second run says already removed; both exit 0', async () => {
+    const f = makeHomeFixture();
+    const configDir = path.join(f.home, '.adm');
+    fs.mkdirSync(configDir);
+    fs.writeFileSync(path.join(configDir, 'config.json'), '{}');
 
-  afterEach(() => {
-    jest.restoreAllMocks();
-  });
-
-  test('removes ~/.adm config directory', async () => {
-    const { uninstall } = require('../../../src/commands/uninstall');
-    await uninstall();
-
-    const calls = mockRm.mock.calls.map(c => c[0]);
-    expect(calls).toContainEqual(expect.stringContaining('.adm'));
-  });
-
-  test('runs npm uninstall -g @crystalgames/adm', async () => {
-    const { uninstall } = require('../../../src/commands/uninstall');
-    await uninstall();
-
-    expect(mockSpawn).toHaveBeenCalledWith(
-      'npm',
-      ['uninstall', '-g', '@crystalgames/adm'],
-      expect.any(Object),
-    );
-  });
-
-  test('attempts to remove /usr/local/bin/adm binary', async () => {
-    const { uninstall } = require('../../../src/commands/uninstall');
-    await uninstall();
-
-    const calls = mockRm.mock.calls.map(c => c[0]);
-    expect(calls).toContain('/usr/local/bin/adm');
-  });
-
-  test('returns true on success', async () => {
-    const { uninstall } = require('../../../src/commands/uninstall');
-    const result = await uninstall();
-    expect(result).toBe(true);
-  });
-
-  test('returns true even if npm uninstall fails (best-effort)', async () => {
-    mockSpawn.mockReturnValue({
-      on: jest.fn((event, cb) => { if (event === 'close') cb(1); }),
-      stdout: { on: jest.fn() },
-      stderr: { on: jest.fn() },
+    const code1 = await runUninstall({
+      configDir, home: f.home,
+      log: s => f.logs.push(s), err: s => f.errs.push(s),
     });
+    expect(code1).toBe(0);
+    expect(fs.existsSync(configDir)).toBe(false);
+    expect(f.logs.join('\n')).toContain(`Removed ${configDir}`);
 
-    const { uninstall } = require('../../../src/commands/uninstall');
-    const result = await uninstall();
-    expect(result).toBe(true);
+    const code2 = await runUninstall({
+      configDir, home: f.home,
+      log: s => f.logs.push(s), err: s => f.errs.push(s),
+    });
+    expect(code2).toBe(0);
+    expect(f.logs.join('\n')).toContain('already removed');
   });
 
-  test('returns true even if config dir removal fails (best-effort)', async () => {
-    mockRm.mockRejectedValueOnce(Object.assign(new Error('EACCES'), { code: 'EACCES' }));
+  test('removes ADM PATH marker lines from rc files only', async () => {
+    const f = makeHomeFixture();
+    const bashrc = path.join(f.home, '.bashrc');
+    fs.writeFileSync(bashrc, [
+      'export EDITOR=vim',
+      'export PATH="/x:$PATH"  # adm-cli npm path',
+      'alias ll="ls -la"',
+    ].join('\n'));
 
-    const { uninstall } = require('../../../src/commands/uninstall');
-    const result = await uninstall();
-    expect(result).toBe(true);
+    const code = await runUninstall({
+      configDir: path.join(f.home, '.adm'), home: f.home,
+      log: s => f.logs.push(s), err: s => f.errs.push(s),
+    });
+    expect(code).toBe(0);
+
+    const content = fs.readFileSync(bashrc, 'utf8');
+    expect(content).toContain('export EDITOR=vim');
+    expect(content).toContain('alias ll');
+    expect(content).not.toContain('adm-cli');
+    expect(f.logs.join('\n')).toContain('.bashrc');
+  });
+
+  test('rc files with no ADM lines are left untouched', async () => {
+    const f = makeHomeFixture();
+    const zshrc = path.join(f.home, '.zshrc');
+    const original = 'export PATH="/usr/local/bin:$PATH"\n';
+    fs.writeFileSync(zshrc, original);
+
+    const code = await runUninstall({
+      configDir: path.join(f.home, '.adm'), home: f.home,
+      log: s => f.logs.push(s), err: s => f.errs.push(s),
+    });
+    expect(code).toBe(0);
+    expect(fs.readFileSync(zshrc, 'utf8')).toBe(original);
   });
 });

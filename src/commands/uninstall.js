@@ -1,72 +1,63 @@
-const fs = require('fs').promises;
+const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { spawn } = require('child_process');
-const chalk = require('chalk');
 
-async function uninstall() {
-  const configDir = process.env.ADM_CONFIG_DIR || path.join(os.homedir(), '.adm');
+// Removes ADM's footprint:
+//   1. the config dir (~/.adm, or ADM_CONFIG_DIR)
+//   2. PATH entries ADM wrote into shell rc files (marker lines)
+// Idempotent by contract: removing nothing still exits 0 ("already removed").
+const RC_FILES = ['.bashrc', '.bash_profile', '.zprofile', '.zshrc', '.profile'];
+const RC_MARKERS = ['# adm-cli', 'adm completion', 'adm-cli npm path'];
 
-  console.log(chalk.yellow('  Uninstalling ADM CLI...\n'));
-
-  // Remove config directory
+function cleanRcFile(rcPath) {
+  let content;
   try {
-    await fs.rm(configDir, { recursive: true, force: true });
-    console.log(chalk.green(`  Removed config directory: ${configDir}`));
-  } catch (err) {
-    if (err.code !== 'ENOENT') {
-      console.log(chalk.red(`  Failed to remove config: ${err.message}`));
-    }
+    content = fs.readFileSync(rcPath, 'utf8');
+  } catch {
+    return { cleaned: false, lines: 0 };
   }
-
-  // Uninstall npm package
-  await new Promise((resolve) => {
-    const child = spawn('npm', ['uninstall', '-g', '@crystalgames/adm'], { stdio: 'pipe' });
-    child.on('close', (code) => {
-      if (code === 0) {
-        console.log(chalk.green('  Removed npm package: @crystalgames/adm'));
-      } else {
-        console.log(chalk.yellow('  npm uninstall failed — package may have been installed differently'));
-      }
-      resolve();
-    });
-  });
-
-  // Remove binary (curl-installed)
-  const binaryPath = '/usr/local/bin/adm';
-  try {
-    await fs.rm(binaryPath, { force: true });
-    console.log(chalk.green(`  Removed binary: ${binaryPath}`));
-  } catch (err) {
-    if (err.code !== 'ENOENT') {
-      console.log(chalk.yellow(`  Could not remove binary: ${err.message}`));
-    }
+  const kept = content.split('\n').filter(line => !RC_MARKERS.some(m => line.includes(m)));
+  if (kept.length === content.split('\n').length) {
+    return { cleaned: false, lines: 0 };
   }
-
-  // Remove shell completions references
-  const shell = process.env.SHELL || '';
-  const rcFiles = [];
-  if (shell.includes('bash')) {
-    rcFiles.push(path.join(os.homedir(), '.bashrc'), path.join(os.homedir(), '.bash_profile'));
-  } else if (shell.includes('zsh')) {
-    rcFiles.push(path.join(os.homedir(), '.zshrc'));
-  }
-
-  for (const rc of rcFiles) {
-    try {
-      let content = await fs.readFile(rc, 'utf8');
-      const cleaned = content.split('\n').filter(
-        line => !line.includes('adm completion') && !line.includes('source.*adm'),
-      ).join('\n');
-      if (content !== cleaned) {
-        await fs.writeFile(rc, cleaned, 'utf8');
-        console.log(chalk.green(`  Cleaned ADM references from ${rc}`));
-      }
-    } catch { /* skip missing rc files */ }
-  }
-
-  console.log(chalk.green('\n  ADM CLI fully uninstalled.'));
-  return true;
+  const removed = content.split('\n').length - kept.length;
+  fs.writeFileSync(rcPath, kept.join('\n'), 'utf8');
+  return { cleaned: true, lines: removed };
 }
 
-module.exports = { uninstall };
+async function runUninstall({ log, err, configDir: cfgDir, home } = {}) {
+  log = log || (s => process.stdout.write(s + '\n'));
+  err = err || (s => process.stderr.write(s + '\n'));
+  const dir = cfgDir || process.env.ADM_CONFIG_DIR || path.join(home || os.homedir(), '.adm');
+  const homeDir = home || os.homedir();
+
+  const dirExisted = fs.existsSync(dir);
+  if (dirExisted) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch (e) {
+      err(`ADM uninstall: failed to remove ${dir}: ${e.message}`);
+      return 2;
+    }
+  }
+
+  const cleanedRcs = [];
+  for (const rc of RC_FILES) {
+    const result = cleanRcFile(path.join(homeDir, rc));
+    if (result.cleaned) cleanedRcs.push(`${rc} (${result.lines} line${result.lines === 1 ? '' : 's'})`);
+  }
+
+  if (dirExisted) {
+    log(`Removed ${dir}`);
+  } else {
+    log(`${dir} already removed`);
+  }
+  if (cleanedRcs.length > 0) {
+    for (const rc of cleanedRcs) log(`Cleaned PATH entries from ~/${rc}`);
+  }
+
+  log('ADM data removed. To uninstall the program itself, remove the npm package: npm rm -g @crystalplatforms/adm');
+  return 0;
+}
+
+module.exports = { runUninstall, RC_FILES, RC_MARKERS };
