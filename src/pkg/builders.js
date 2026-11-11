@@ -57,6 +57,10 @@ const NPM_BINS = {
   '@anthropic-ai/gemini-cli': 'gemini',
   '@githubnext/github-copilot-cli': 'github-copilot-cli',
   '@plandex/cli': 'plandex',
+  // npm package name differs from the produced binary — the status probe
+  // must check the REAL command or installed tools look "not installed"
+  // (HITL finding, 0.3.0: picking installed TypeScript kept re-"installing").
+  typescript: 'tsc',
 };
 const GO_BINS = { delve: 'dlv', gomock: 'mockgen' };
 const CARGO_BINS = { delta: 'delta', 'fd-find': 'fd', ripgrep: 'rg', 'du-dust': 'dust', bottom: 'btm' };
@@ -91,6 +95,17 @@ function buildToolPlan(tool, env, opts = {}) {
 
   switch (method) {
     case 'nvm':
+      // POSIX nvm installs via the official script. Windows has no `sh` (and
+      // nvm-windows is a different tool entirely) — install Node.js LTS
+      // through the detected manager instead (HITL finding, 0.3.0).
+      if (env.os === 'win32') {
+        const NODE_WIN = { winget: 'OpenJS.NodeJS.LTS', choco: 'nodejs-lts', scoop: 'nodejs-lts' };
+        const nodePkg = NODE_WIN[env.manager];
+        if (!nodePkg) {
+          return { status: 'manual', reason: 'no supported package manager for Node.js — install the LTS from https://nodejs.org' };
+        }
+        return planned({ command: installCommand(env.manager, nodePkg), manager: env.manager, package: nodePkg, statusSource: 'command -v node' });
+      }
       return planned({ command: NVM_INSTALL, statusSource: 'command -v node' });
 
     case 'npm':
@@ -167,6 +182,27 @@ function buildToolPlan(tool, env, opts = {}) {
   }
 }
 
+// Best-effort retry route for a tool whose primary plan came back manual
+// (#34: the wizard must try, not silently refuse). The manager route already
+// failed — before giving up, try the script-installer table for the same
+// platform. Returns the original entry when no script route exists either
+// (the executor then reports `failed` with the reason as the hint).
+function withFallbackRoute(entry, env) {
+  if (entry.status !== 'manual') return entry;
+  const resolved = resolveScript(entry.id, env.os, env.arch);
+  if (resolved.manual) return entry;
+  return {
+    ...entry,
+    status: 'planned',
+    command: resolved.run,
+    package: resolved.url,
+    shell: resolved.shell,
+    method: 'script',
+    retryFallback: true,
+    statusSource: entry.statusSource || `command -v ${statusBin(entry.id, 'script')}`,
+  };
+}
+
 function statusBin(id, method) {
   if (NPM_BINS[id]) return NPM_BINS[id];
   if (GO_BINS[id]) return GO_BINS[id];
@@ -181,4 +217,4 @@ const ALL_METHODS = [
   'brew', 'apt', 'dnf', 'pacman', 'zypper', 'apk', 'winget', 'choco', 'scoop',
 ];
 
-module.exports = { buildToolPlan, pipCommand, statusBin, ALL_METHODS, NVM_INSTALL };
+module.exports = { buildToolPlan, withFallbackRoute, pipCommand, statusBin, ALL_METHODS, NVM_INSTALL };

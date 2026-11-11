@@ -31,10 +31,11 @@ function fakePrompt(answers) {
 const fakeSpinner = () => ({ start() {}, succeed() {}, fail() {}, info() {}, stop() {} });
 const makeCfg = () => fs.mkdtempSync(path.join(os.tmpdir(), 'adm-wiz-'));
 
-// execFunc: `command -v typescript` finds it; everything else is missing.
-// Installs succeed unless the tool is esbuild (simulated network failure).
+// execFunc: `command -v tsc` (the TypeScript binary — see NPM_BINS) finds it;
+// everything else is missing. Installs succeed unless the tool is esbuild
+// (simulated network failure).
 function fakeExec() {
-  const installed = ['typescript'];
+  const installed = ['tsc'];
   return (command, opts, cb) => {
     if (/^git config --global user\./.test(command)) return cb(null, '', '');
     const probe = command.match(/(?:command -v|where) (\w[\w-]*)/);
@@ -107,7 +108,7 @@ describe('wizard — categories screen', () => {
 });
 
 describe('wizard — tools screen', () => {
-  test('installed tools show ✓ and are disabled (not reinstalled)', () => {
+  test('installed tools show ✓ and STAY selectable (pick = reinstall, #34)', () => {
     const tools = [
       { id: 'typescript', name: 'TypeScript', installMethod: 'npm' },
       { id: 'vitest', name: 'Vitest', installMethod: 'npm' },
@@ -117,16 +118,16 @@ describe('wizard — tools screen', () => {
       ['vitest', { entry: { id: 'vitest', status: 'planned' }, installed: false }],
     ]);
     const choices = toolChoices(tools, statuses);
-    // clean label: the ✓ mark on the name, ONE short "(…)" suffix rendered
-    // by the prompt from `disabled`
+    // ✓ mark stays (it tells the user the tool is present), but nothing is
+    // disabled anymore — picking it triggers a reinstall
     expect(choices[0].name).toBe('✓ TypeScript');
-    expect(choices[0].disabled).toBe('installed');
+    expect(choices[0].disabled).toBeFalsy();
     expect(choices[0].checked).toBe(false);
     expect(choices[1].disabled).toBeFalsy();
     expect(choices[1].name).toBe('Vitest');
   });
 
-  test('manual and link tools are locked with a short "(manual)" label', () => {
+  test('manual and link tools are selectable too — retry, not lock (#34)', () => {
     const tools = [
       { id: 'pyenv', name: 'pyenv', installMethod: 'brew' },
       { id: 'some-ext', name: 'Some Ext', installMethod: 'link' },
@@ -136,14 +137,16 @@ describe('wizard — tools screen', () => {
       ['some-ext', { entry: { id: 'some-ext', status: 'link', url: 'https://x' }, installed: false }],
     ]);
     const choices = toolChoices(tools, statuses);
-    expect(choices[0].disabled).toBe('manual');
+    // labels stay minimal (#34): no extra annotation text
     expect(choices[0].name).toBe('pyenv');
-    expect(choices[1].disabled).toBe('manual');
+    expect(choices[0].disabled).toBeFalsy();
+    expect(choices[1].name).toBe('Some Ext');
+    expect(choices[1].disabled).toBeFalsy();
   });
 
   test('collectStatuses probes each tool via its statusSource', async () => {
     const entries = [
-      { id: 'typescript', status: 'planned', statusSource: 'command -v typescript' },
+      { id: 'typescript', status: 'planned', statusSource: 'command -v tsc' },
       { id: 'vitest', status: 'planned', statusSource: 'command -v vitest' },
     ];
     const statuses = await collectStatuses(entries, { execFunc: fakeExec(), platform: 'linux' });
@@ -219,9 +222,33 @@ describe('wizard — full simulated-TTY flow', () => {
     expect(prompt.questions.some(q => q.name === 'proceed')).toBe(false);
   });
 
-  test('a tool already installed that the user still picks → skipped, never reinstalled', async () => {
+  test('a tool already installed that the user still picks → REINSTALLED (#34)', async () => {
     const lines = [];
+    const configDir = makeCfg();
     const checkbox = fakeCheckbox({ categories: ['js-ts'], tools: ['typescript'] });
+    const prompt = fakePrompt({ proceed: false });
+    const code = await runWizard({
+      log: s => lines.push(s),
+      prompt,
+      checkbox,
+      spinnerFactory: fakeSpinner,
+      execFunc: fakeExec(),
+      configDir,
+    });
+    expect(code).toBe(0);
+    const report = lines.join('\n');
+    // the install command RAN (forced) and the report says `reinstalled`
+    expect(report).toContain('✓ TypeScript — reinstalled');
+    // the registry got the (refreshed) entry
+    const registry = JSON.parse(fs.readFileSync(path.join(configDir, 'installed.json'), 'utf8'));
+    expect(registry.find(e => e.id === 'typescript')).toBeTruthy();
+    // a reinstall is not a fresh install → still no git identity question
+    expect(prompt.questions.some(q => q.name === 'proceed')).toBe(false);
+  });
+
+  test('a manual pick with no fallback → manual guidance, NOT a failure (owner decision)', async () => {
+    const lines = [];
+    const checkbox = fakeCheckbox({ categories: ['ruby'], tools: ['dry-rb'] });
     const prompt = fakePrompt({ proceed: false });
     const code = await runWizard({
       log: s => lines.push(s),
@@ -233,15 +260,92 @@ describe('wizard — full simulated-TTY flow', () => {
     });
     expect(code).toBe(0);
     const report = lines.join('\n');
-    expect(report).toContain('skipped');
-    expect(report).toContain('already installed');
-    // no install command ever ran for typescript
-    expect(report).not.toContain('npm install -g typescript');
-    // nothing was installed → no git question either
-    expect(prompt.questions.some(q => q.name === 'proceed')).toBe(false);
+    // dry-rb has no manager route and no script route → `manual` status with
+    // the guidance as the hint — an info line, not a ✗ failure
+    expect(report).toContain('i dry-rb — manual');
+    expect(report).toContain('dry-rb is a family of gems');
+    expect(report).not.toContain('✗ dry-rb');
   });
 
-  test('nothing installable picked → short message, no git nag', async () => {
+  test('picking Node.js on Windows ASKS; declining → manual guidance, nothing executed', async () => {
+    const lines = [];
+    const commands = [];
+    const exec = (command, opts, cb) => {
+      commands.push(command);
+      if (/^git config --global user\./.test(command)) return cb(null, '', '');
+      const probe = command.match(/(?:command -v|where) (\w[\w.-]*)/);
+      if (probe) return cb({ code: 1 }, '', '');
+      cb(null, 'installed ok', '');
+    };
+    const checkbox = fakeCheckbox({ categories: ['js-ts'], tools: ['node'] });
+    const prompt = fakePrompt({ proceed: false }); // nodeRuntime → default false
+    const code = await runWizard({
+      log: s => lines.push(s),
+      prompt,
+      checkbox,
+      spinnerFactory: fakeSpinner,
+      execFunc: exec,
+      configDir: makeCfg(),
+      env: { os: 'win32', distro: null, distroVersion: null, manager: 'winget', arch: 'x64', isWSL: false, shell: 'powershell', rcFile: null },
+    });
+    expect(code).toBe(0);
+    // the question was asked as a confirm
+    const q = prompt.questions.find(x => x.name === 'nodeRuntime');
+    expect(q.type).toBe('confirm');
+    const report = lines.join('\n');
+    expect(report).toContain('i Node.js — manual');
+    expect(report).toContain('winget install --id OpenJS.NodeJS.LTS');
+    // the dangerous install command never ran — no Restart Manager kill
+    expect(commands.some(c => /winget install|nvm-sh\/nvm/.test(c))).toBe(false);
+  });
+
+  test('picking Node.js on Windows + confirming → the install really runs', async () => {
+    const lines = [];
+    const commands = [];
+    const exec = (command, opts, cb) => {
+      commands.push(command);
+      if (/^git config --global user\./.test(command)) return cb(null, '', '');
+      const probe = command.match(/(?:command -v|where) (\w[\w.-]*)/);
+      if (probe) return cb({ code: 1 }, '', '');
+      cb(null, 'installed ok', '');
+    };
+    const checkbox = fakeCheckbox({ categories: ['js-ts'], tools: ['node'] });
+    const prompt = fakePrompt({ nodeRuntime: true });
+    const code = await runWizard({
+      log: s => lines.push(s),
+      prompt,
+      checkbox,
+      spinnerFactory: fakeSpinner,
+      execFunc: exec,
+      configDir: makeCfg(),
+      env: { os: 'win32', distro: null, distroVersion: null, manager: 'winget', arch: 'x64', isWSL: false, shell: 'powershell', rcFile: null },
+    });
+    expect(code).toBe(0);
+    // confirmed → the winget install actually executed
+    expect(commands.some(c => c.includes('winget install --id OpenJS.NodeJS.LTS'))).toBe(true);
+    expect(lines.join('\n')).toContain('✓ Node.js — installed');
+  });
+
+  test('picking a link-only extension → manual guidance with the URL', async () => {
+    const lines = [];
+    const checkbox = fakeCheckbox({ categories: ['artificial-intelligence'], tools: ['copilot-ext'] });
+    const prompt = fakePrompt({ proceed: false });
+    const code = await runWizard({
+      log: s => lines.push(s),
+      prompt,
+      checkbox,
+      spinnerFactory: fakeSpinner,
+      execFunc: fakeExec(),
+      configDir: makeCfg(),
+    });
+    expect(code).toBe(0);
+    const report = lines.join('\n');
+    expect(report).toMatch(/i .+ — manual/);
+    expect(report).toMatch(/install from: https?:\/\//);
+    expect(report).not.toContain('— failed');
+  });
+
+  test('nothing picked → short message, no git nag', async () => {
     const lines = [];
     const checkbox = fakeCheckbox({ categories: ['js-ts'], tools: [] });
     const prompt = fakePrompt({ proceed: false });
@@ -255,7 +359,7 @@ describe('wizard — full simulated-TTY flow', () => {
     });
     expect(code).toBe(0);
     const text = lines.join('\n');
-    expect(text).toContain('Nothing to install');
+    expect(text).toContain('Nothing selected');
     expect(prompt.questions.some(q => q.name === 'proceed')).toBe(false);
   });
 });

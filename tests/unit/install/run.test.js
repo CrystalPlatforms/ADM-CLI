@@ -31,7 +31,7 @@ describe('runInstall', () => {
     const path = require('path');
     const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'adm-reg-'));
     const { execFunc } = collect([
-      { match: /command -v typescript/, err: { code: 1 }, stdout: '', stderr: '' },
+      { match: /command -v tsc/, err: { code: 1 }, stdout: '', stderr: '' },
       { match: /npm install -g typescript/, err: null, stdout: 'added 1 package' },
       { match: /npm config get prefix/, err: null, stdout: '/home/dev/.npm-global\n' },
     ]);

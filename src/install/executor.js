@@ -143,6 +143,8 @@ function isEaccsFailure(res) {
 }
 
 // Installs ONE entry. Returns the per-tool result (see module doc).
+// opts.force (or entry.force — set per-entry by the wizard's reinstall, #34)
+// skips the "already installed" probe: the install command runs regardless.
 async function installEntry(entry, opts = {}) {
   const platform = opts.platform || process.platform;
   const base = { id: entry.id, name: entry.name, category: entry.category, method: entry.method };
@@ -154,12 +156,20 @@ async function installEntry(entry, opts = {}) {
     return { ...base, status: 'skipped', reason: 'manual extension — install from the link', url: entry.url };
   }
 
-  // Already present → skipped (AC: rerun → all skipped).
-  if (await isInstalled(entry, opts)) {
+  // Already present → skipped (AC: rerun → all skipped) — unless the caller
+  // explicitly forces a reinstall (#34: wizard picks of installed tools).
+  if (!opts.force && !entry.force && await isInstalled(entry, opts)) {
     return { ...base, status: 'skipped', reason: 'already installed', statusSource: entry.statusSource };
   }
 
-  const command = entry.command;
+  // Reinstall semantics (HITL finding, 0.3.0): winget refuses a plain
+  // `install` when the package already exists ("No applicable upgrade
+  // found", exit ≠ 0) — a forced reinstall needs `--force`. choco likewise
+  // needs `--force` to actually reinstall instead of no-op-ing. npm/brew/
+  // apt & friends reinstall (or no-op with exit 0) out of the box.
+  const command = entry.force && (entry.manager === 'winget' || entry.manager === 'choco')
+    ? `${entry.command} --force`
+    : entry.command;
   // shell: 'powershell' only for Windows script-tools that need it; otherwise
   // the per-platform default (sh on unix, cmd on Windows).
   const shell = platform === 'win32' && entry.shell ? entry.shell : undefined;

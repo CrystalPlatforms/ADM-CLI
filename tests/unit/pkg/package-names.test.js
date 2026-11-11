@@ -43,6 +43,35 @@ describe('package-name mapping — completeness (threshold: 0)', () => {
       }
     }
   });
+
+  test('NO identity default on winget — every id is Publisher.Package or manual (HITL fix)', () => {
+    // winget requires exact Publisher.Package ids (Git.Git) — a bare tool id
+    // ("git") always fails with "No package found matching input criteria".
+    const ECOSYSTEM = new Set(['nvm', 'npm', 'node', 'pip', 'python', 'cargo', 'go', 'gem', 'composer', 'dotnet', 'rustup', 'script', 'link']);
+    const wingetRoute = allTools.filter(t => !ECOSYSTEM.has(t.installMethod));
+    expect(wingetRoute.length).toBeGreaterThan(60); // sanity: the list is exercised
+    const bad = [];
+    for (const tool of wingetRoute) {
+      const r = resolvePackageName(tool.id, 'winget');
+      if (r.manual) continue;
+      if (r.name === tool.id || !/\./.test(r.name)) bad.push(`${tool.id} → ${r.name}`);
+    }
+    expect(bad).toEqual([]);
+  });
+
+  test('the tools broken in HITL testing map to the verified winget ids', () => {
+    expect(resolvePackageName('git', 'winget')).toEqual({ name: 'Git.Git' });
+    expect(resolvePackageName('gh', 'winget')).toEqual({ name: 'GitHub.cli' });
+    expect(resolvePackageName('git-lfs', 'winget')).toEqual({ name: 'GitHub.GitLFS' });
+    expect(resolvePackageName('go', 'winget')).toEqual({ name: 'GoLang.Go' });
+    expect(resolvePackageName('kubectl', 'winget')).toEqual({ name: 'Kubernetes.kubectl' });
+    expect(resolvePackageName('ollama', 'winget')).toEqual({ name: 'Ollama.Ollama' });
+    expect(resolvePackageName('k9s', 'winget')).toEqual({ name: 'Derailed.k9s' });
+    // the clobbered duplicate-key mapping is back:
+    expect(resolvePackageName('watchman', 'winget')).toEqual({ name: 'facebook.watchman' });
+    // GnuWin32.Tree's installer is interactive — headless installs abort
+    expect(resolvePackageName('tree', 'winget').manual).toContain('scoop install tree');
+  });
 });
 
 describe('resolvePackageName — known renames', () => {

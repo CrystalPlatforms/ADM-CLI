@@ -1,4 +1,18 @@
 #!/usr/bin/env node
+// ── Node < 20 gate (#33) — MUST run before requiring anything else ──────
+// src/ at large uses modern syntax, so on old Node the first require would
+// die with an opaque SyntaxError. nodeCheck() lives in its own
+// old-Node-parseable module and prints a friendly, enumerated fix list
+// (exit 1). The portable bundle ships its own Node ≥ 20 — bundle users
+// never see this.
+const { nodeCheck } = require('../src/engines');
+
+const check = nodeCheck(process.versions);
+if (!check.ok) {
+  process.stderr.write(check.message);
+  process.exit(1);
+}
+
 const { main } = require('../src/router');
 
 main(process.argv.slice(2))

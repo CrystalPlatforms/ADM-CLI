@@ -67,6 +67,20 @@ describe('route — usage errors enumerate the valid set', () => {
     expect(route(['uninstall', '--extra'], d)).toBe(1);
   });
 
+  test('upgrade rejects unknown flags and enumerates the valid set', async () => {
+    const d = sink();
+    expect(await route(['upgrade', '--bogus'], d)).toBe(1);
+    expect(d.calls.err.join('\n')).toContain('--check');
+    expect(d.calls.err.join('\n')).toContain('--dry-run');
+  });
+
+  test('update is a routed alias of upgrade (no "Unknown command")', async () => {
+    const d = sink();
+    // flag validation fires before any channel/network work — safe to call
+    expect(await route(['update', '--bogus'], d)).toBe(1);
+    expect(d.calls.err.join('\n')).not.toContain('Unknown command');
+  });
+
   test('dotfiles without sync subcommand exits 1 and names the valid subcommand', () => {
     const d = sink();
     expect(route(['dotfiles'], d)).toBe(1);

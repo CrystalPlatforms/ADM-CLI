@@ -1,6 +1,6 @@
 const { loadCatalog, getToolsByCategories } = require('./catalog');
 const { detectEnvironment } = require('../platform');
-const { buildToolPlan } = require('../pkg/builders');
+const { buildToolPlan, withFallbackRoute } = require('../pkg/builders');
 const { isInstalled, executeInstall } = require('../install/executor');
 const { renderResults } = require('../install/report');
 const { appendInstalled } = require('./registry');
@@ -14,11 +14,16 @@ const { miniSpinner } = require('./spinner');
 // Acceptance-critical details:
 //   - the category screen renders ALL categories on ONE screen (pageSize ==
 //     category count → inquirer never paginates)
-//   - the tools screen marks already-installed tools "✓ … (installed)",
-//     unchecked and disabled — they report `skipped`, never reinstall
+//   - the tools screen marks already-installed tools "✓ …" but keeps them
+//     selectable — picking one triggers a REINSTALL (status `reinstalled`)
+//     (#34: nothing in the list silently refuses anymore)
+//   - manual/link tools stay selectable too: the best available route runs
+//     (script fallback), and only a genuine dead end lands in the report as
+//     `failed` with a hint (#34) — a failed retry never blocks the run
 //   - every install runs with an ora spinner (spinnerFactory injectable for
 //     tests) and appends to ~/.adm/installed.json via the registry
-//   - the final report reuses renderResults: ✓ installed / skipped / ✗ + hint
+//   - the final report reuses renderResults: ✓ installed / ✓ reinstalled /
+//     skipped / ✗ + hint
 //
 // All I/O is injectable (prompt, execFunc, spinnerFactory, configDir) so the
 // whole flow is testable without a TTY (simulated-TTY tests).
@@ -39,17 +44,14 @@ async function collectStatuses(entries, opts = {}) {
 }
 
 // Builds the tools checkbox choices with status marks (#30 story 8).
-// Clean labels: the reason goes to `disabled`, the prompt renders it as one
-// short "(…)" suffix — no stacked double annotations.
+// Everything stays selectable (#34): installed tools carry a "✓" mark (and
+// reinstall on pick), manual/link tools keep a clean label (and retry the
+// best available route on pick) — no disabled rows, no locked tools.
 function toolChoices(tools, statuses) {
   return tools.map(tool => {
     const st = statuses.get(tool.id);
     if (st && st.installed) {
-      return { name: `✓ ${tool.name}`, value: tool.id, disabled: 'installed', checked: false };
-    }
-    const entry = st && st.entry;
-    if (entry && (entry.status === 'manual' || entry.status === 'link')) {
-      return { name: tool.name, value: tool.id, disabled: 'manual', checked: false };
+      return { name: `✓ ${tool.name}`, value: tool.id, checked: false };
     }
     return { name: tool.name, value: tool.id, checked: false };
   });
@@ -66,9 +68,10 @@ async function runWizard(opts = {}) {
     execFunc,
     home,
     configDir,
+    env: envOverride, // injectable for tests (defaults to real detection)
   } = opts;
 
-  const env = detectEnvironment();
+  const env = envOverride || detectEnvironment();
   const catalog = loadCatalog();
 
   // Ctrl+C in the checkbox prompt → graceful exit, exit code 0.
@@ -112,12 +115,73 @@ async function runWizard(opts = {}) {
   }));
   if (selectedIds === null) return 0;
 
-  // Installed tools stay in the list on purpose: the executor probes them
-  // again and reports them as `skipped` — they are never reinstalled.
+  // Everything the user picked is attempted (#34):
+  //   - an installed pick forces a REINSTALL (executor skips its
+  //     "already installed" probe) and lands as `reinstalled` in the report
+  //   - a manual pick first retries the script-install fallback route
+  //   - tools with NO route on this platform (manual after the fallback,
+  //     link-only extensions) run nothing — they land in the report as
+  //     `manual` entries with a copyable hint. Owner decision (0.3.0 HITL):
+  //     a missing route is GUIDANCE, not a failure.
   const toInstall = (selectedIds || [])
     .map(id => statuses.get(id))
-    .filter(st => st && st.entry && st.entry.status === 'planned')
-    .map(st => st.entry);
+    .filter(st => st && st.entry)
+    .map(st => {
+      const entry = withFallbackRoute(st.entry, env);
+      entry.force = Boolean(st.installed);
+      return entry;
+    });
+
+  // ── split picks: runnable vs. guidance-only ─────────────────────────
+  const manualResults = [];
+  const runnable = [];
+  for (const entry of toInstall) {
+    if (entry.status === 'manual') {
+      manualResults.push({
+        id: entry.id, name: entry.name, category: entry.category, method: entry.method,
+        status: 'manual', hint: entry.reason,
+      });
+    } else if (entry.status === 'link') {
+      manualResults.push({
+        id: entry.id, name: entry.name, category: entry.category, method: entry.method,
+        status: 'manual', hint: `install from: ${entry.url || '(no link known)'}`,
+      });
+    } else {
+      runnable.push(entry);
+    }
+  }
+
+  // ── Windows runtime question (HITL finding, 0.3.0) ──────────────────
+  // ADM always runs under Node. On Windows, installing Node.js spawns an
+  // MSI whose Restart Manager restarts running node.exe processes — it can
+  // kill THIS session mid-run. Owner decision: ASK, and on confirmation
+  // really install (the risk belongs to whoever answered "yes"). POSIX is
+  // safe (nvm installs into ~/.nvm, nothing restarts processes).
+  if ((env.os || process.platform) === 'win32') {
+    const nodeIdx = runnable.findIndex(e => e.id === 'node');
+    if (nodeIdx >= 0) {
+      let confirmed = false;
+      try {
+        const answer = await prompt([{
+          name: 'nodeRuntime',
+          type: 'confirm',
+          message: 'Installing Node.js from inside ADM can restart this session (the Windows installer restarts running node.exe). Install anyway?',
+          default: false,
+        }]);
+        confirmed = Boolean(answer && answer.nodeRuntime);
+      } catch {
+        confirmed = false; // prompt cancelled → treat as declined
+      }
+      if (!confirmed) {
+        const [entry] = runnable.splice(nodeIdx, 1);
+        manualResults.push({
+          id: entry.id, name: entry.name, category: entry.category, method: entry.method,
+          status: 'manual',
+          hint: 'close ADM, then run in a separate terminal: winget install --id OpenJS.NodeJS.LTS --exact --accept-source-agreements --accept-package-agreements',
+        });
+      }
+    }
+  }
 
   // git step ONLY when the user actually installed git or gh — installing
   // unrelated tools must not nag about git identity. A previous decline
@@ -131,40 +195,55 @@ async function runWizard(opts = {}) {
   }
   let gitOffered = false;
 
-  if (toInstall.length === 0) {
-    log('Nothing to install — everything you picked is already present.');
+  if (runnable.length === 0 && manualResults.length === 0) {
+    log('Nothing selected — nothing to do.');
   } else {
-    // ── 3. install with a spinner per tool (story 7) ──────────────
-    let spinner = null;
-    const outcome = await executeInstall(toInstall, {
-      execFunc,
-      home,
-      rcFile: env.rcFile,
-      onStart: ({ tool }) => {
-        if (spinner) spinner.stop();
-        spinner = spinnerFactory(`Installing ${tool.name}...`);
-        spinner.start();
-      },
-      onProgress: ({ tool, result }) => {
-        if (!spinner) return;
-        if (result.status === 'installed') spinner.succeed(`${tool.name} installed`);
-        else if (result.status === 'skipped') spinner.info(`${tool.name} already installed`);
-        else spinner.fail(`${tool.name} failed (see report below)`);
-        spinner = null;
-      },
-      onInstalled: entry => appendInstalled(entry, { configDir }),
-    });
+    let results = manualResults;
 
-    // The git-identity question belongs to a git/gh install specifically.
-    if (outcome.installed > 0 && !declinedBefore) {
-      const GIT_TOOLS = new Set(['git', 'gh']);
-      gitOffered = outcome.results.some(r => r.status === 'installed' && GIT_TOOLS.has(r.id));
+    if (runnable.length > 0) {
+      // ── 3. install with a spinner per tool (story 7) ──────────────
+      let spinner = null;
+      const outcome = await executeInstall(runnable, {
+        execFunc,
+        home,
+        rcFile: env.rcFile,
+        onStart: ({ tool }) => {
+          if (spinner) spinner.stop();
+          spinner = spinnerFactory(tool.force ? `Reinstalling ${tool.name}...` : `Installing ${tool.name}...`);
+          spinner.start();
+        },
+        onProgress: ({ tool, result }) => {
+          if (!spinner) return;
+          if (result.status === 'installed') spinner.succeed(`${tool.name} ${tool.force ? 'reinstalled' : 'installed'}`);
+          else if (result.status === 'skipped') spinner.info(`${tool.name} already installed`);
+          else spinner.fail(`${tool.name} failed (see report below)`);
+          spinner = null;
+        },
+        onInstalled: entry => appendInstalled(entry, { configDir }),
+      });
+
+      // ── 4. final report: ✓ installed / ✓ reinstalled / i manual / ✗ ──
+      // Forced picks of already-installed tools report as `reinstalled`
+      // (the non-interactive ADM_TOOLS runner keeps its own contract).
+      const reinstalledIds = new Set(runnable.filter(e => e.force).map(e => e.id));
+      results = [...outcome.results.map(r => {
+        if (r.status === 'installed' && reinstalledIds.has(r.id)) {
+          return { ...r, status: 'reinstalled' };
+        }
+        return r;
+      }), ...manualResults];
+
+      // The git-identity question belongs to a git/gh FRESH install — a
+      // reinstall means the user already has it configured.
+      if (outcome.installed > 0 && !declinedBefore) {
+        const GIT_TOOLS = new Set(['git', 'gh']);
+        gitOffered = results.some(r => r.status === 'installed' && GIT_TOOLS.has(r.id));
+      }
     }
 
-    // ── 4. final report: ✓ / ✓ skipped / ✗ + hint (story 9) ───────
     log('');
     log('Install report:');
-    log(renderResults(outcome.results, { summary: false }));
+    log(renderResults(results, { summary: false }));
   }
 
   // ── 5. git step (story 10) — only after an actual install happened ──

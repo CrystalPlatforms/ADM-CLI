@@ -4,6 +4,7 @@ const { showHelp, renderCommandLines } = require('./commands/help');
 const { runFeedback } = require('./commands/feedback');
 const { runConfig } = require('./commands/config');
 const { runUninstall } = require('./commands/uninstall');
+const { runUpgrade } = require('./upgrade');
 const { runDotfilesSync } = require('./commands/dotfiles');
 const { runPlan } = require('./install/plan');
 const { runInstall } = require('./install/run');
@@ -94,6 +95,11 @@ function route(argv, deps = {}) {
   if (head === 'uninstall') {
     if (rest.length > 0) return usageError(`"uninstall" takes no arguments, got: ${rest.join(' ')}`, err);
     return runUninstall({ log, err });
+  }
+
+  // ── upgrade / update (#32) ───────────────────────────────────
+  if (head === 'upgrade' || head === 'update') {
+    return runUpgrade(rest, { log, err });
   }
 
   // ── dotfiles sync ────────────────────────────────────────────

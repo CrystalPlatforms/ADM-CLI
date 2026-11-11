@@ -1,4 +1,4 @@
-const { buildToolPlan, pipCommand, ALL_METHODS } = require('../../../src/pkg/builders');
+const { buildToolPlan, withFallbackRoute, pipCommand, ALL_METHODS } = require('../../../src/pkg/builders');
 const { SUPPORTED_MANAGERS } = require('../../../src/pkg/managers');
 
 const ENVS = {
@@ -99,8 +99,8 @@ describe('manual and missing-manager handling', () => {
   });
 
   test('planned entries carry a status source', () => {
-    const plan = buildToolPlan({ id: 'typescript', installMethod: 'npm' }, ENVS.linux);
-    expect(plan.statusSource).toBe('command -v typescript');
+    const plan = buildToolPlan({ id: 'vitest', installMethod: 'npm' }, ENVS.linux);
+    expect(plan.statusSource).toBe('command -v vitest');
   });
 
   test('scoped npm tools check the unscoped binary name', () => {
@@ -108,9 +108,75 @@ describe('manual and missing-manager handling', () => {
     expect(plan.statusSource).toBe('command -v claude');
   });
 
+  test('typescript probes tsc — the binary npm actually creates (HITL fix)', () => {
+    const plan = buildToolPlan({ id: 'typescript', installMethod: 'npm' }, ENVS.linux);
+    expect(plan.statusSource).toBe('command -v tsc');
+  });
+
   test('cargo renames: delta → git-delta crate, status checks delta', () => {
     const plan = buildToolPlan({ id: 'delta', installMethod: 'cargo' }, ENVS.linux);
     expect(plan.command).toBe('cargo install git-delta');
     expect(plan.statusSource).toBe('command -v delta');
+  });
+});
+
+describe('nvm method — Windows route (HITL fix, 0.3.0)', () => {
+  test('win32 + winget → Node.js LTS via winget (no `sh` pipe)', () => {
+    const plan = buildToolPlan({ id: 'node', installMethod: 'nvm' }, ENVS.win);
+    expect(plan.status).toBe('planned');
+    expect(plan.command).toContain('winget install --id OpenJS.NodeJS.LTS');
+    expect(plan.statusSource).toBe('command -v node');
+  });
+
+  test('win32 + choco/scoop → nodejs-lts', () => {
+    expect(buildToolPlan({ id: 'node', installMethod: 'nvm' }, ENVS.choco).command).toContain('nodejs-lts');
+    expect(buildToolPlan({ id: 'node', installMethod: 'nvm' }, ENVS.scoop).command).toContain('nodejs-lts');
+  });
+
+  test('win32 without a supported manager → manual with nodejs.org guidance', () => {
+    const plan = buildToolPlan({ id: 'node', installMethod: 'nvm' }, { ...ENVS.win, manager: 'none' });
+    expect(plan.status).toBe('manual');
+    expect(plan.reason).toContain('https://nodejs.org');
+  });
+
+  test('POSIX keeps the nvm install script', () => {
+    const plan = buildToolPlan({ id: 'node', installMethod: 'nvm' }, ENVS.linux);
+    expect(plan.command).toContain('nvm-sh/nvm');
+  });
+});
+
+describe('withFallbackRoute — retry route for manual tools (#34)', () => {
+  test('manual + script installer known for the platform → planned script route', () => {
+    const entry = withFallbackRoute(
+      { id: 'helm', status: 'manual', reason: 'no package manager detected' },
+      ENVS.linux,
+    );
+    expect(entry.status).toBe('planned');
+    expect(entry.retryFallback).toBe(true);
+    expect(entry.method).toBe('script');
+    expect(entry.command).toContain('get-helm-3');
+  });
+
+  test('manual + no script installer anywhere → stays manual (failed + hint)', () => {
+    const entry = withFallbackRoute(
+      { id: 'dry-rb', status: 'manual', reason: 'dry-rb is a family of gems' },
+      ENVS.linux,
+    );
+    expect(entry.status).toBe('manual');
+    expect(entry.retryFallback).toBeUndefined();
+    expect(entry.reason).toBe('dry-rb is a family of gems');
+  });
+
+  test('script manual for the os-arch pair (no script for win32) → stays manual', () => {
+    const entry = withFallbackRoute(
+      { id: 'helm', status: 'manual', reason: 'on Windows install helm via winget' },
+      ENVS.win,
+    );
+    expect(entry.status).toBe('manual');
+  });
+
+  test('planned entries pass through untouched', () => {
+    const entry = { id: 'typescript', status: 'planned', command: 'npm install -g typescript@latest' };
+    expect(withFallbackRoute(entry, ENVS.linux)).toBe(entry);
   });
 });

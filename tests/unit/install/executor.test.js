@@ -129,6 +129,69 @@ describe('executor.installEntry', () => {
     expect(res.status).toBe('skipped');
     expect(res.url).toBe('https://example.com');
   });
+
+  test('force (entry.force) skips the "already installed" probe and reinstalls (#34)', async () => {
+    const exec = (command, opts, cb) => {
+      // the probe FINDS the tool (it is installed) — force must ignore that
+      if (/command -v|where /.test(command)) return cb(null, '/usr/bin/typescript', '');
+      cb(null, 'installed ok', '');
+    };
+    const res = await installEntry(
+      { ...NPM_ENTRY, id: 'typescript', name: 'TypeScript', force: true },
+      { execFunc: exec, platform: 'linux', npmPrefixRepair: false },
+    );
+    expect(res.status).toBe('installed');
+    expect(res.command).toBe(NPM_ENTRY.command);
+
+    // without force the same probe → skipped (old contract intact)
+    const skipped = await installEntry(
+      { ...NPM_ENTRY, id: 'typescript', name: 'TypeScript' },
+      { execFunc: exec, platform: 'linux', npmPrefixRepair: false },
+    );
+    expect(skipped.status).toBe('skipped');
+    expect(skipped.reason).toBe('already installed');
+  });
+
+  test('forced reinstall of a winget/choco package appends --force (HITL fix)', async () => {
+    const exec = (command, opts, cb) => {
+      if (/command -v|where /.test(command)) return cb(null, '/usr/bin/jq', '');
+      cb(null, 'installed ok', '');
+    };
+    const res = await installEntry(
+      { id: 'jq', name: 'jq', category: 'universal', method: 'brew', status: 'planned',
+        command: 'winget install --id jqlang.jq --exact --accept-source-agreements --accept-package-agreements',
+        manager: 'winget', package: 'jqlang.jq', force: true },
+      { execFunc: exec, platform: 'win32', npmPrefixRepair: false },
+    );
+    expect(res.status).toBe('installed');
+    expect(res.command).toContain('--force');
+
+    // fresh install (no force, probe misses) keeps the plain command
+    const execMissing = (command, opts, cb) => {
+      if (/command -v|where /.test(command)) return cb({ code: 1 }, '', '');
+      cb(null, 'installed ok', '');
+    };
+    const fresh = await installEntry(
+      { id: 'jq', name: 'jq', category: 'universal', method: 'brew', status: 'planned',
+        command: 'winget install --id jqlang.jq --exact --accept-source-agreements --accept-package-agreements',
+        manager: 'winget', package: 'jqlang.jq' },
+      { execFunc: execMissing, platform: 'win32', npmPrefixRepair: false },
+    );
+    expect(fresh.status).toBe('installed');
+    expect(fresh.command).not.toContain('--force');
+  });
+
+  test('opts.force applies to every entry (bulk reinstall)', async () => {
+    const exec = (command, opts, cb) => {
+      if (/command -v|where /.test(command)) return cb(null, '/usr/bin/x', '');
+      cb(null, 'installed ok', '');
+    };
+    const res = await installEntry(
+      { ...NPM_ENTRY, id: 'a', name: 'A' },
+      { execFunc: exec, platform: 'linux', npmPrefixRepair: false, force: true },
+    );
+    expect(res.status).toBe('installed');
+  });
 });
 
 describe('executor.executeInstall', () => {

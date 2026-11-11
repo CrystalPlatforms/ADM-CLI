@@ -31,4 +31,25 @@ describe('renderResults', () => {
     ], { summary: false });
     expect(text).toContain('https://example.com');
   });
+
+  test('reinstalled renders as ✓ reinstalled and shows in the summary (#34)', () => {
+    const text = renderResults([
+      { id: 'a', name: 'Tool A', status: 'reinstalled' },
+      { id: 'b', name: 'Tool B', status: 'installed' },
+    ]);
+    expect(text).toContain('✓ Tool A — reinstalled');
+    expect(text).toContain('✓ Tool B — installed');
+    expect(text).toContain('Done: 1 installed, 1 reinstalled, 0 skipped, 0 failed.');
+  });
+
+  test('manual renders as an info line with the hint, not a failure', () => {
+    const text = renderResults([
+      { id: 'tmux', name: 'tmux', status: 'manual', hint: 'use WSL: wsl -e bash -c "sudo apt install tmux"' },
+      { id: 'a', name: 'Tool A', status: 'installed' },
+    ]);
+    expect(text).toContain('i tmux — manual');
+    expect(text).toContain('use WSL: wsl -e bash -c "sudo apt install tmux"');
+    expect(text).not.toContain('✗ tmux');
+    expect(text).toContain('Done: 1 installed, 0 skipped, 1 manual, 0 failed.');
+  });
 });
