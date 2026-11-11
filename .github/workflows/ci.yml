@@ -65,13 +65,15 @@ jobs:
       - name: Install (local bundle) in debian:bookworm-slim — no Node, no sudo
         run: |
           VERSION=$(node -p "require('./package.json').version")
-          docker run --rm -v "$PWD:/w" -e HOME=/tmp/admhome -e ADM_BUNDLE=/w/dist/adm-v$VERSION-linux-x64.tar.gz \
+          # HOME must live on the HOST (mounted in) — container /tmp is
+          # ephemeral and vanishes between docker runs.
+          rm -rf "$RUNNER_TEMP/admhome" && mkdir -p "$RUNNER_TEMP/admhome"
+          docker run --rm -v "$PWD:/w" -v "$RUNNER_TEMP/admhome:/home/adm" -e HOME=/home/adm \
             debian:bookworm-slim sh /w/scripts/installer.sh
       - name: adm -v works (bundled Node)
         run: |
-          VERSION=$(node -p "require('./package.json').version")
-          docker run --rm -v "$PWD:/w" -e HOME=/tmp/admhome \
-            debian:bookworm-slim sh -c '/tmp/admhome/.local/bin/adm -v'
+          docker run --rm -v "$RUNNER_TEMP/admhome:/home/adm" -e HOME=/home/adm \
+            debian:bookworm-slim sh -c '/home/adm/.local/bin/adm -v'
       - name: Tamper test — wrong sha256 aborts before writing anything
         run: |
           VERSION=$(node -p "require('./package.json').version")
@@ -86,12 +88,15 @@ jobs:
       - name: Idempotency — double install leaves exactly one marker
         run: |
           VERSION=$(node -p "require('./package.json').version")
-          docker run --rm -v "$PWD:/w" -e HOME=/tmp/idemhome -e ADM_BUNDLE=/w/dist/adm-v$VERSION-linux-x64.tar.gz \
+          rm -rf "$RUNNER_TEMP/idemhome" && mkdir -p "$RUNNER_TEMP/idemhome"
+          docker run --rm -v "$PWD:/w" -v "$RUNNER_TEMP/idemhome:/home/idem" -e HOME=/home/idem \
+            -e ADM_BUNDLE=/w/dist/adm-v$VERSION-linux-x64.tar.gz \
             debian:bookworm-slim sh /w/scripts/installer.sh >/dev/null
-          docker run --rm -v "$PWD:/w" -e HOME=/tmp/idemhome -e ADM_BUNDLE=/w/dist/adm-v$VERSION-linux-x64.tar.gz \
+          docker run --rm -v "$PWD:/w" -v "$RUNNER_TEMP/idemhome:/home/idem" -e HOME=/home/idem \
+            -e ADM_BUNDLE=/w/dist/adm-v$VERSION-linux-x64.tar.gz \
             debian:bookworm-slim sh /w/scripts/installer.sh >/dev/null
-          docker run --rm -e HOME=/tmp/idemhome debian:bookworm-slim \
-            sh -c 'N=$(grep -c "# adm-cli" /tmp/idemhome/.profile || true); [ "$N" = "1" ] || { echo "markers: $N"; exit 1; }'
+          docker run --rm -v "$RUNNER_TEMP/idemhome:/home/idem" -e HOME=/home/idem debian:bookworm-slim \
+            sh -c 'N=$(grep -c "# adm-cli" /home/idem/.profile || true); [ "$N" = "1" ] || { echo "markers: $N"; exit 1; }'
 
   # ── #31: PowerShell installer on a real Windows runner ────────────────
   installer-windows:

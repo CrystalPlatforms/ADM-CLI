@@ -57,6 +57,8 @@ d('installer.sh', () => {
       HOME: home,
       ADM_BUNDLE: fixture.bundle,
       ADM_BUNDLE_SHA256: fixture.hash,
+      ADM_DRY_RUN: '1', // the flag the test name promises
+      SHELL: '', // SHELL unset → the rc default is ~/.profile
     });
     // dry-run with a local bundle still verifies the checksum (read-only),
     // then prints the plan and exits 0.
@@ -74,6 +76,7 @@ d('installer.sh', () => {
       HOME: home,
       ADM_BUNDLE: fixture.bundle,
       ADM_BUNDLE_SHA256: fixture.hash,
+      SHELL: '', // SHELL unset → the rc default is ~/.profile (CI runners set bash!)
     });
     expect(r.status).toBe(0);
     // unpacked to ~/.adm/{app,runtime}
@@ -93,7 +96,7 @@ d('installer.sh', () => {
   test('AC: double install → zero duplicates (idempotent rc)', () => {
     const home = path.join(work, 'home');
     fs.mkdirSync(home);
-    const env = { HOME: home, ADM_BUNDLE: fixture.bundle, ADM_BUNDLE_SHA256: fixture.hash };
+    const env = { HOME: home, ADM_BUNDLE: fixture.bundle, ADM_BUNDLE_SHA256: fixture.hash, SHELL: '' };
     expect(runInstaller(env).status).toBe(0);
     const r2 = runInstaller(env);
     expect(r2.status).toBe(0);
