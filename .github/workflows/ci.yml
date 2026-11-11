@@ -69,6 +69,7 @@ jobs:
           # ephemeral and vanishes between docker runs.
           rm -rf "$RUNNER_TEMP/admhome" && mkdir -p "$RUNNER_TEMP/admhome"
           docker run --rm -v "$PWD:/w" -v "$RUNNER_TEMP/admhome:/home/adm" -e HOME=/home/adm \
+            -e ADM_BUNDLE=/w/dist/adm-v$VERSION-linux-x64.tar.gz \
             debian:bookworm-slim sh /w/scripts/installer.sh
       - name: adm -v works (bundled Node)
         run: |

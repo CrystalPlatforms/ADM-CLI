@@ -67,7 +67,9 @@ echo ""
 
 # ── 2. source: local bundle or release download ─────────────────────
 TMP=""
-cleanup() { [ -n "$TMP" ] && [ -d "$TMP" ] && rm -rf "$TMP"; }
+# `|| true`: with set -e, a failing cleanup (empty TMP on the dry-run path)
+# would override the script's exit status (dry-run exited 0 → reported 1).
+cleanup() { [ -n "$TMP" ] && [ -d "$TMP" ] && rm -rf "$TMP" || true; }
 trap cleanup EXIT INT TERM
 
 if [ -n "${ADM_BUNDLE:-}" ]; then
