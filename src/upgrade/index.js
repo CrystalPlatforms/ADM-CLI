@@ -24,6 +24,8 @@ const os = require('os');
 const path = require('path');
 const { Readable } = require('stream');
 const { getVersion } = require('../commands/version');
+const { loader } = require('../setup/loader');
+const { saveReport } = require('../reports');
 
 const REPO = 'CrystalPlatforms/ADM-CLI';
 const NPM_PACKAGE = '@crystalplatforms/adm';
@@ -297,17 +299,36 @@ function fmtBytes(n) {
 }
 
 async function runUpgrade(argv = [], deps = {}) {
-  const log = deps.log || (s => process.stdout.write(s + '\n'));
-  const err = deps.err || (s => process.stderr.write(s + '\n'));
+  const baseLog = deps.log || (s => process.stdout.write(s + '\n'));
+  const baseErr = deps.err || (s => process.stderr.write(s + '\n'));
+  // tee: everything the upgrade prints is collected for the persisted report
+  const output = [];
+  const log = s => { output.push(s); baseLog(s); };
+  const err = s => { output.push(s); baseErr(s); };
   const fsMod = deps.fs || fs;
   const env = deps.env || process.env;
   const platform = deps.platform || process.platform;
   const home = deps.home || os.homedir();
   const fetchFn = deps.fetchFn || global.fetch;
-  const spinnerFactory = deps.spinnerFactory || (t => require('../setup/spinner').miniSpinner(t));
+  const spinnerFactory = deps.spinnerFactory || (t => loader(t));
   const currentVersion = deps.version || getVersion();
   const apiBase = deps.apiBase || API_BASE;
   const downloadBase = deps.downloadBase || DOWNLOAD_BASE;
+
+  // Persist the upgrade report to the global cache (owner decision).
+  // Only REAL upgrade attempts are persisted — `--check`, npm-channel hints
+  // and `--dry-run` are status queries, not reports.
+  const persistReport = status => {
+    if (!deps.configDir) return; // explicit config dir required from callers/tests
+    const body = [
+      `ADM upgrade report — ${new Date().toISOString()}`,
+      `ADM ${currentVersion} → v${latest || '?'} · ${status}`,
+      '',
+      output.join('\n'),
+    ].join('\n') + '\n';
+    const saved = saveReport('upgrade', body, { configDir: deps.configDir });
+    if (saved.error) baseErr(`⚠ ${saved.error}`);
+  };
 
   // ── flags ────────────────────────────────────────────────────────────
   const check = argv.includes('--check');
@@ -343,6 +364,7 @@ async function runUpgrade(argv = [], deps = {}) {
   } catch (e) {
     spin.fail('Could not resolve the latest release');
     err(`ADM failed: ${e.message}`);
+    persistReport('failed (cannot resolve latest release)');
     return 2;
   }
 
@@ -445,10 +467,12 @@ async function runUpgrade(argv = [], deps = {}) {
       log(`  note: the previous runtime was still running — its backup stays at ${keptBackups.join(', ')}`);
       log('  (it is removed automatically by the next upgrade, or delete it manually)');
     }
+    persistReport(`success (${currentVersion} → ${latest})`);
     return 0;
   } catch (e) {
     if (spin) spin.fail(e.rolledBack ? 'Upgrade failed — your previous version was restored' : 'Upgrade failed');
     err(`ADM failed: ${e.message}`);
+    persistReport(e.rolledBack ? 'failed (rolled back)' : 'failed');
     return 2;
   } finally {
     try { fsMod.rmSync(tmp, { recursive: true, force: true }); } catch { /* best effort */ }

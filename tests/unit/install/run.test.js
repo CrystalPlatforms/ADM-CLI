@@ -85,6 +85,7 @@ describe('runInstall', () => {
       execFunc,
       platform: 'linux',
       npmPrefixRepair: false,
+      configDir: '/tmp/adm-run-test-unused',
     });
     expect(code).toBe(2);
     const text = out.join('\n');

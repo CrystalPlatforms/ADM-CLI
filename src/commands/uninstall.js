@@ -1,6 +1,8 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { saveReport } = require('../reports');
+const { getVersion } = require('../commands/version');
 
 // Removes ADM's footprint:
 //   1. the config dir (~/.adm, or ADM_CONFIG_DIR)
@@ -71,6 +73,18 @@ async function runUninstall({ log, err, configDir: cfgDir, home } = {}) {
   }
 
   log('ADM data removed. To uninstall the program itself, remove the npm package: npm rm -g @crystalplatforms/adm');
+
+  // Persist the uninstall report (owner decision: all reports are saved) —
+  // but the config dir is GONE by design, so the report lands in the OS
+  // temp dir instead of resurrecting ~/.adm.
+  const body = [
+    `ADM uninstall report — ${new Date().toISOString()}`,
+    `ADM ${getVersion()}`,
+    `config dir: ${dirExisted ? `removed (${dir})` : `already removed (${dir})`}`,
+    cleanedRcs.length ? `cleaned rc entries: ${cleanedRcs.join(', ')}` : 'no rc entries cleaned',
+  ].join('\n') + '\n';
+  const saved = saveReport('uninstall', body, { configDir: os.tmpdir() });
+  if (saved.file) log(`Uninstall report saved: ${saved.file}`);
   return 0;
 }
 

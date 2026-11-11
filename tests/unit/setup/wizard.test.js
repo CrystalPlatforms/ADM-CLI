@@ -65,6 +65,7 @@ describe('wizard — categories screen', () => {
     const catQ = checkbox.prompts.find(p => p.name === 'categories');
     const catalog = loadCatalog();
     expect(catalog).toHaveLength(11);
+    expect(catQ.message).toBe('Choose categories...');
     expect(catQ.choices).toHaveLength(11);
     // pageSize == number of categories → the whole list on one screen
     expect(catQ.pageSize).toBe(11);
@@ -84,6 +85,8 @@ describe('wizard — categories screen', () => {
     });
     expect(code).toBe(0);
     expect(lines.join('\n')).toContain('Nothing selected');
+    // the banner came first
+    expect(lines[0]).toContain('CrystalPlatforms ADM-CLI v');
     expect(checkbox.prompts.some(p => p.name === 'tools')).toBe(false);
   });
 
@@ -176,6 +179,13 @@ describe('wizard — full simulated-TTY flow', () => {
 
     expect(code).toBe(0);
     const report = lines.join('\n');
+    // new UX: banner → ✓ Chosen … lines → Worked for → report (owner decision)
+    expect(lines[0]).toContain('CrystalPlatforms ADM-CLI v');
+    expect(report).toContain('✓ Chosen 1 category.');
+    expect(report).toContain('✓ Chosen 2 tools to install.');
+    expect(report).toContain('Worked for ');
+    const toolsQ = checkbox.prompts.find(p => p.name === 'tools');
+    expect(toolsQ.message).toBe('Choose tools to install...');
     // git was installed → its identity question was asked and declined
     expect(prompt.questions.some(q => q.name === 'proceed')).toBe(true);
     // the decline is remembered → the wizard never asks again
@@ -237,6 +247,8 @@ describe('wizard — full simulated-TTY flow', () => {
     });
     expect(code).toBe(0);
     const report = lines.join('\n');
+    expect(report).toContain('✓ Chosen 1 tool to install.');
+    expect(report).toContain('Worked for ');
     // the install command RAN (forced) and the report says `reinstalled`
     expect(report).toContain('✓ TypeScript — reinstalled');
     // the registry got the (refreshed) entry
@@ -278,21 +290,27 @@ describe('wizard — full simulated-TTY flow', () => {
       cb(null, 'installed ok', '');
     };
     const checkbox = fakeCheckbox({ categories: ['js-ts'], tools: ['node'] });
-    const prompt = fakePrompt({ proceed: false }); // nodeRuntime → default false
+    const prompt = fakePrompt({ proceed: false });
+    let confirmMessage = null;
     const code = await runWizard({
       log: s => lines.push(s),
       prompt,
       checkbox,
+      confirm: async opts => {
+        confirmMessage = opts.message;
+        lines.push(opts.answerLine(false)); // the prompt renders this atomically
+        return false;
+      },
       spinnerFactory: fakeSpinner,
       execFunc: exec,
       configDir: makeCfg(),
       env: { os: 'win32', distro: null, distroVersion: null, manager: 'winget', arch: 'x64', isWSL: false, shell: 'powershell', rcFile: null },
     });
     expect(code).toBe(0);
-    // the question was asked as a confirm
-    const q = prompt.questions.find(x => x.name === 'nodeRuntime');
-    expect(q.type).toBe('confirm');
+    expect(confirmMessage).toContain('restart this session');
     const report = lines.join('\n');
+    // declining transforms the question into a ❗ done-format line
+    expect(report).toContain('❗ Node.js install declined');
     expect(report).toContain('i Node.js — manual');
     expect(report).toContain('winget install --id OpenJS.NodeJS.LTS');
     // the dangerous install command never ran — no Restart Manager kill
@@ -310,17 +328,23 @@ describe('wizard — full simulated-TTY flow', () => {
       cb(null, 'installed ok', '');
     };
     const checkbox = fakeCheckbox({ categories: ['js-ts'], tools: ['node'] });
-    const prompt = fakePrompt({ nodeRuntime: true });
+    const prompt = fakePrompt({ proceed: false });
     const code = await runWizard({
       log: s => lines.push(s),
       prompt,
       checkbox,
+      confirm: async opts => {
+        lines.push(opts.answerLine(true)); // the prompt renders this atomically
+        return true;
+      },
       spinnerFactory: fakeSpinner,
       execFunc: exec,
       configDir: makeCfg(),
       env: { os: 'win32', distro: null, distroVersion: null, manager: 'winget', arch: 'x64', isWSL: false, shell: 'powershell', rcFile: null },
     });
     expect(code).toBe(0);
+    // confirming transforms the question into a ✓ done-format line
+    expect(lines.join('\n')).toContain('✓ Node.js install confirmed.');
     // confirmed → the winget install actually executed
     expect(commands.some(c => c.includes('winget install --id OpenJS.NodeJS.LTS'))).toBe(true);
     expect(lines.join('\n')).toContain('✓ Node.js — installed');

@@ -1,5 +1,5 @@
 const { EventEmitter } = require('events');
-const { checkboxPrompt, eraseFrame } = require('../../../src/setup/prompts');
+const { checkboxPrompt, confirmPrompt, eraseFrame } = require('../../../src/setup/prompts');
 
 // The flicker-free checkbox prompt: every render is ONE stdout write
 // (erase + content composed together) — the acceptance criterion for "no
@@ -112,5 +112,52 @@ describe('checkboxPrompt', () => {
       stdout: fakeStdout(),
       stdin: { isTTY: false },
     })).rejects.toThrow('TTY');
+  });
+});
+
+describe('confirmPrompt — atomic y/n (owner fix, 0.3.x)', () => {
+  async function runConfirm(keys, { defaultValue = false } = {}) {
+    const stdout = fakeStdout();
+    const inputStream = new EventEmitter();
+    const p = confirmPrompt({
+      message: 'Installing Node.js from inside ADM can restart this session. Install anyway?',
+      defaultValue,
+      answerLine: ok => (ok ? '✓ confirmed' : '❗ declined'),
+      stdout,
+      inputStream,
+    });
+    await new Promise(r => setImmediate(r));
+    for (const k of keys) inputStream.emit('keypress', k.name || k, k);
+    const result = await p;
+    return { result, writes: stdout.writes.join(''), writeList: stdout.writes };
+  }
+
+  test('y → true, question atomically replaced by the answer line', async () => {
+    const { result, writes, writeList } = await runConfirm([{ name: 'y' }]);
+    expect(result).toBe(true);
+    expect(writes).toMatch(/\? Installing Node\.js from inside ADM can restart this session\./);
+    expect(writes).toContain('(y/n)');
+    expect(writes).toContain('✓ confirmed');
+    // cursor hidden while waiting, restored after
+    expect(writes).toContain('\x1b[?25l');
+    expect(writes).toContain('\x1b[?25h');
+    // atomicity: erase + answer line left the console in ONE write
+    const atomic = writeList.find(w => w.includes('✓ confirmed'));
+    expect(atomic).toContain('\x1b[J');
+  });
+
+  test('n → false with the declined line', async () => {
+    const { result, writes } = await runConfirm([{ name: 'n' }]);
+    expect(result).toBe(false);
+    expect(writes).toContain('❗ declined');
+  });
+
+  test('Enter takes the default (false here)', async () => {
+    const { result } = await runConfirm([{ name: 'enter' }]);
+    expect(result).toBe(false);
+  });
+
+  test('Ctrl+C → ADM_CANCELLED', async () => {
+    await expect(runConfirm([{ name: 'c', ctrl: true }])).rejects.toThrow('cancelled');
   });
 });

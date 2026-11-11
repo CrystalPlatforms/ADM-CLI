@@ -123,6 +123,7 @@ function makeDeps({ admHome, home, downloadBase = '/download', api = '/api/repos
     version: '0.2.3',
     apiBase: `${baseUrl}${api}`,
     downloadBase: `${baseUrl}${downloadBase}`,
+    configDir: path.join(root, 'cfg'), // upgrade reports persist here
     spinnerFactory: () => stubSpinner(out),
     log: s => out.push(s),
     err: err || (() => {}),
@@ -162,6 +163,7 @@ function fsFailingRm() {
 
 beforeAll(async () => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'adm-upgrade-test-'));
+  fs.mkdirSync(path.join(root, 'cfg'), { recursive: true }); // config dir for report persistence
   const fixture = buildFixture();
   server = await startServer(fixture);
   baseUrl = `http://127.0.0.1:${server.address().port}`;
@@ -279,6 +281,12 @@ describe('runUpgrade — bundle channel', () => {
     expect(pkg.version).toBe('9.9.9');
     expect(fs.readFileSync(path.join(admHome, 'runtime', 'node.txt'), 'utf8')).toBe('fake runtime');
     expect(deps.out.join('\n')).toContain('9.9.9');
+    // the upgrade report was persisted to the global cache (owner decision)
+    const reports = path.join(root, 'cfg', 'reports');
+    const files = fs.readdirSync(reports).filter(f => f.startsWith('report-'));
+    expect(files.length).toBeGreaterThanOrEqual(1);
+    expect(fs.readFileSync(path.join(reports, files[files.length - 1]), 'utf8'))
+      .toContain('0.2.3 → v9.9.9 · success');
   });
 
   test('asset with a bad sha256 → abort, old version intact, exit 2', async () => {

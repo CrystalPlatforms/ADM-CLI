@@ -71,11 +71,11 @@ async function syncDotfiles(options = {}) {
         const sourceStat = fs.statSync(sourcePath);
         fs.chmodSync(targetPath, sourceStat.mode);
         result.copied.push(file);
-        console.log(chalk.green(`  ✔ Copied ${file}`));
+        console.log(chalk.green(`  ✓ Copied ${file}`));
       } else {
         fs.symlinkSync(sourcePath, targetPath);
         result.symlinked.push(file);
-        console.log(chalk.green(`  ✔ Symlink ${file}`));
+        console.log(chalk.green(`  ✓ Symlink ${file}`));
       }
     } catch (err) {
       result.errors.push({ file, error: err.message });

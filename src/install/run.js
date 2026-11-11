@@ -6,6 +6,8 @@ const { executeInstall } = require('./executor');
 const { renderResults } = require('./report');
 const { appendInstalled } = require('../setup/registry');
 const { parseToolIds } = require('./plan');
+const { saveReport } = require('../reports');
+const { getVersion } = require('../commands/version');
 
 // Builds plan entries for a validated tool-id list (shared with plan.js).
 function planEntriesFor(requested, { environment } = {}) {
@@ -63,9 +65,22 @@ async function runInstall(toolsSpec, opts = {}) {
     onInstalled: opts.onInstalled || (entry => appendInstalled(entry, { configDir: opts.configDir })),
   });
 
-  log(renderResults(outcome.results, { summary: false }));
+  const reportText = renderResults(outcome.results, { summary: false });
+  log(reportText);
   log('');
   log(`Done: ${outcome.installed} installed, ${outcome.skipped} skipped, ${outcome.failed} failed.`);
+
+  // Persist the report to the global cache (owner decision) — a missing
+  // config dir yields a loud ⚠ on stderr, never a silent skip.
+  const body = [
+    `ADM install report — ${new Date().toISOString()}`,
+    `ADM ${getVersion()} · ADM_TOOLS=${toolsSpec}`,
+    '',
+    reportText,
+    `Done: ${outcome.installed} installed, ${outcome.skipped} skipped, ${outcome.failed} failed.`,
+  ].join('\n') + '\n';
+  const saved = saveReport('install', body, { configDir: opts.configDir });
+  if (saved.error) err(`⚠ ${saved.error}`);
 
   return outcome.failed > 0 ? 2 : 0;
 }
