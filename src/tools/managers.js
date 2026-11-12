@@ -52,11 +52,17 @@ function parsePipList(raw) {
 // cargo (`cargo install --list`): text — "<crate> v<version>:" per installed
 // crate, indented binary names below (NOT entries). A non-empty output with
 // zero crate lines is garbage → null.
+// `cargo install --list`:
+//   ba v0.2.5:                     — from crates.io
+//   umux v1.0.2 (C:\...\cli):      — --path / --git installs print the SOURCE
+//                                    in parentheses (Windows paths included)
+//       <binary>                   — binaries a crate provides (skipped: the
+//                                    entry is the crate, binPath stays null)
 function parseCargoInstallList(raw) {
   const lines = String(raw || '').split(/\r?\n/);
   const entries = [];
   for (const line of lines) {
-    const m = line.match(/^(\S+) v(\S+):$/);
+    const m = line.match(/^(\S+) v(\S+)(?: \([^)]*\))?:$/);
     if (m) entries.push({ id: m[1], name: m[1], version: m[2], binPath: null });
   }
   if (!String(raw || '').trim()) return [];

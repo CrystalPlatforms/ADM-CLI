@@ -29,6 +29,15 @@ const { getToolInfo } = require('../../../src/tools/tool-info');
 
 const mktmp = prefix => fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 
+// PATH stub with EXISTING manager binaries — capability flags gate on the
+// manager binary actually being reachable (owner fix: registry entries can
+// carry a method whose manager is absent on this machine).
+const stubPath = (...bins) => {
+  const dir = mktmp('adm-ti-mgrbin-');
+  for (const bin of bins) fs.writeFileSync(path.join(dir, bin), '#!/bin/sh\n');
+  return { PATH: dir };
+};
+
 describe('getToolInfo (fixture directory tree)', () => {
   test('returns the COMPLETE bundle for a fictitious tool: version/path/method/size/config/cache/docs/flags', () => {
     const home = mktmp('adm-ti-home-');
@@ -46,7 +55,7 @@ describe('getToolInfo (fixture directory tree)', () => {
       binPath: path.join(root, 'mytool'),
       source: 'other', manager: 'cargo', installedAt: null,
     };
-    const info = getToolInfo(entry, { platform: 'linux', home, env: {} });
+    const info = getToolInfo(entry, { platform: 'linux', home, env: stubPath('cargo') });
 
     expect(info).toMatchObject({
       version: '1.2.3',
@@ -59,11 +68,20 @@ describe('getToolInfo (fixture directory tree)', () => {
       docsPaths: [],                   // /usr/share/doc/mytool absent on the fixture host
     });
     expect(info.flags).toEqual({
-      canUpdate: true,                 // known manager (cargo)
+      canUpdate: true,                 // known manager (cargo) AND reachable on PATH
       canRemove: true,
       hasCache: true,                  // cache dir found
       canReveal: false,                // no xdg-open on the fixture PATH
     });
+  });
+
+  test('a manager NOT on the PATH dims u/r (registry method without the manager)', () => {
+    const home = mktmp('adm-ti-home-');
+    const info = getToolInfo(
+      { id: 'git', name: 'Git', version: null, binPath: null, source: 'adm', manager: 'brew', installedAt: null },
+      { platform: 'linux', home, env: { PATH: '' } }, // no brew anywhere
+    );
+    expect(info.flags).toEqual({ canUpdate: false, canRemove: false, hasCache: false, canReveal: false });
   });
 
   test('a FILE binPath sizes as the file itself (no walk)', () => {
@@ -141,6 +159,59 @@ describe('docs locations that actually exist (owner fix: docs was ALWAYS "—" o
   });
 });
 
+describe('well-known config/cache locations (owner fix: panel showed "—" almost everywhere)', () => {
+  test('git → the REAL config (~/.gitconfig), not a generic guess', () => {
+    const home = mktmp('adm-ti-wk-git-');
+    fs.writeFileSync(path.join(home, '.gitconfig'), '[user]');
+    const info = getToolInfo(
+      { id: 'git', name: 'Git', version: null, binPath: null, source: 'adm', manager: 'winget', installedAt: null },
+      { platform: 'linux', home, env: {} },
+    );
+    expect(info.configPaths).toEqual([path.join(home, '.gitconfig')]);
+  });
+
+  test('npm → config ~/.npmrc + cache ~/.npm (win32: npm-cache)', () => {
+    const home = mktmp('adm-ti-wk-npm-');
+    fs.writeFileSync(path.join(home, '.npmrc'), 'x');
+    fs.mkdirSync(path.join(home, '.npm'), { recursive: true });
+    const info = getToolInfo(
+      { id: 'npm', name: 'npm', version: null, binPath: null, source: 'system', manager: 'npm', installedAt: null },
+      { platform: 'linux', home, env: {} },
+    );
+    expect(info.configPaths).toEqual([path.join(home, '.npmrc')]);
+    expect(info.cachePaths).toEqual([path.join(home, '.npm')]);
+    expect(info.flags.hasCache).toBe(true);
+  });
+
+  test('gh on win32 → %APPDATA%\\GitHub CLI; nothing exists → still [] (never invented)', () => {
+    const home = mktmp('adm-ti-wk-gh-');
+    const ghDir = path.join(home, 'AppData', 'Roaming', 'GitHub CLI');
+    fs.mkdirSync(ghDir, { recursive: true });
+    const found = getToolInfo(
+      { id: 'gh', name: 'GitHub CLI', version: null, binPath: null, source: 'adm', manager: 'winget', installedAt: null },
+      { platform: 'win32', home, env: {} },
+    );
+    expect(found.configPaths).toContain(ghDir);
+
+    const empty = getToolInfo(
+      { id: 'gh', name: 'GitHub CLI', version: null, binPath: null, source: 'adm', manager: 'winget', installedAt: null },
+      { platform: 'win32', home: mktmp('adm-ti-wk-gh2-'), env: {} },
+    );
+    expect(empty.configPaths).toEqual([]);
+  });
+
+  test('cargo → cache ~/.cargo/registry (feeds the remove checkbox with REAL cleanup targets)', () => {
+    const home = mktmp('adm-ti-wk-cargo-');
+    fs.mkdirSync(path.join(home, '.cargo', 'registry'), { recursive: true });
+    const info = getToolInfo(
+      { id: 'cargo', name: 'cargo', version: null, binPath: null, source: 'system', manager: 'cargo', installedAt: null },
+      { platform: 'linux', home, env: {} },
+    );
+    expect(info.cachePaths).toEqual([path.join(home, '.cargo', 'registry')]);
+    expect(info.flags.hasCache).toBe(true);
+  });
+});
+
 describe('capability flags matrix', () => {
   const entryWith = over => ({
     id: 'x', name: 'x', version: null, binPath: null, source: 'other', manager: null, installedAt: null,
@@ -149,10 +220,21 @@ describe('capability flags matrix', () => {
   const opts = over => ({ platform: 'linux', home: mktmp('adm-ti-flag-'), env: {}, ...over });
 
   test('known manager → canUpdate + canRemove; unknown → both false', () => {
-    expect(getToolInfo(entryWith({ manager: 'npm' }), opts()).flags.canUpdate).toBe(true);
-    expect(getToolInfo(entryWith({ manager: 'dpkg' }), opts()).flags.canRemove).toBe(true);
+    expect(getToolInfo(entryWith({ manager: 'npm' }), opts({ env: stubPath('npm') })).flags.canUpdate).toBe(true);
+    expect(getToolInfo(entryWith({ manager: 'dpkg' }), opts({ env: stubPath('apt') })).flags.canRemove).toBe(true);
     expect(getToolInfo(entryWith({ manager: null }), opts()).flags.canUpdate).toBe(false);
     expect(getToolInfo(entryWith({ manager: null }), opts()).flags.canRemove).toBe(false);
+  });
+
+  test('u/r gate on the manager binary: absent manager dims both — go remove is the exception', () => {
+    // nothing on PATH: npm cannot update or remove; a 'go' entry removes as a
+    // plain file delete (no binary needed) but still cannot update
+    const bare = opts();
+    expect(getToolInfo(entryWith({ manager: 'npm' }), bare).flags).toMatchObject({ canUpdate: false, canRemove: false });
+    expect(getToolInfo(entryWith({ manager: 'go' }), bare).flags).toMatchObject({ canUpdate: false, canRemove: true });
+    // the binary present: both true
+    const withGo = opts({ env: stubPath('go') });
+    expect(getToolInfo(entryWith({ manager: 'go' }), withGo).flags).toMatchObject({ canUpdate: true, canRemove: true });
   });
 
   test('canReveal needs BOTH a binPath and the platform opener', () => {

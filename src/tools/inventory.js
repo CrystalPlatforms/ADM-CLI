@@ -3,6 +3,7 @@ const os = require('os');
 const path = require('path');
 const { registryFile } = require('../setup/registry');
 const { loadCatalog } = require('../setup/catalog');
+const { resolvePackageName } = require('../pkg/package-names');
 const {
   parseBrewList,
   parsePipList,
@@ -144,13 +145,62 @@ function findOnPath(binName, { env, platform, statSync, accessSync }) {
     for (const ext of exts) {
       const candidate = `${dir}${psep}${binName}${ext}`;
       try {
-        statSync(candidate);
         accessSync(candidate);
-        return candidate;
       } catch {
-        // next candidate
+        continue; // not reachable → next candidate
       }
+      // ACCESS is the authority: statSync can throw EACCES on Windows
+      // app-execution aliases (winget.exe is a reparse point in
+      // WindowsApps) even though the executable works. statSync still
+      // filters directories that merely share the tool's name.
+      let ok = true;
+      try {
+        ok = statSync(candidate).isFile();
+      } catch {
+        // stat unavailable (alias) — the reachable candidate wins
+      }
+      if (ok) return candidate;
     }
+  }
+  return null;
+}
+
+// Manager-binary map (owner fix): the registry records a method family, but
+// the COMMANDS run a specific binary — dpkg-query READS, apt REMOVES; the
+// read probe may differ from the action binary, hence dpkg→apt / rpm→dnf.
+// Shared by the scan (registry healing) and tool-info (capability flags).
+const MANAGER_BIN = {
+  npm: 'npm', brew: 'brew', pip: 'pip3', cargo: 'cargo', go: 'go',
+  dpkg: 'apt', rpm: 'dnf', pacman: 'pacman', zypper: 'zypper', apk: 'apk',
+  winget: 'winget', choco: 'choco', scoop: 'scoop',
+};
+
+// Is the manager binary actually reachable? Registry entries can carry a
+// method whose manager does not exist on THIS machine (git recorded 'brew'
+// on Windows) — such a method must not claim attribution nor enable actions.
+function managerAvailable(managerKey, { env, platform, statSync, accessSync }) {
+  const bin = MANAGER_BIN[managerKey];
+  if (!bin) return false;
+  try {
+    return Boolean(findOnPath(bin, { env, platform, statSync, accessSync }));
+  } catch {
+    return false;
+  }
+}
+
+// Healed registry entries fall back to the DETECTED system manager of this
+// machine (same first-available order the adm wizard uses for installs) —
+// a manager-backed registry method that is absent almost certainly belongs
+// to this manager instead. Null when no system manager exists at all.
+const SYSTEM_MANAGERS_BY_PLATFORM = {
+  win32: ['winget', 'choco', 'scoop'],
+  linux: ['apt', 'dnf', 'pacman', 'zypper', 'apk'],
+  darwin: ['brew'],
+};
+
+function detectSystemManager({ env, platform, statSync, accessSync }) {
+  for (const m of SYSTEM_MANAGERS_BY_PLATFORM[platform] || []) {
+    if (managerAvailable(m, { env, platform, statSync, accessSync })) return m;
   }
   return null;
 }
@@ -197,20 +247,28 @@ async function evaluateSource(src, opts, platform) {
   return parseSourceRaw(src, fetched.raw);
 }
 
-// Group warning policy: when NO source of the group yielded anything, every
-// failure warns (missing manager + broken output). When at least one source
-// succeeded, only present-but-unparseable sources keep warning — missing
-// managers stay silent (a Debian box without pacman is normal, not noise).
+// Group warning policy (owner fix): a MISSING manager (binary absent — brew
+// on Windows, ~/go/bin without go) is normal, not noise → silent. Only
+// PRESENT-but-BROKEN output (unparseable, corrupt) warns: an empty group
+// without a warning is hidden entirely by the TUI.
 function groupWarning(results, srcByKey) {
-  const failed = results.filter(r => !r.ok);
-  if (failed.length === 0) return null;
-  const ok = results.filter(r => r.ok);
-  const warned = ok.length > 0 ? failed.filter(f => !f.missing) : failed;
-  const msgs = warned.map(f => {
-    const src = srcByKey.get(f.key);
-    return f.missing ? src.missing : src.broken;
-  });
+  const msgs = results
+    .filter(r => !r.ok && !r.missing)
+    .map(f => srcByKey.get(f.key).broken);
   return msgs.filter(Boolean).join('; ') || null;
+}
+
+// Finds the stored entry this manager PACKAGE belongs to: 'Git.Git' matches
+// the stored 'git' (resolvePackageName('git', 'winget') === 'Git.Git').
+// Unmapped/manual mappings never match (a { manual } result has no name).
+function findPackageMatch(stored, packageId, managerKey) {
+  for (const e of stored) {
+    if (e.manager === managerKey || e.manager === null || e.manager === undefined) {
+      const r = resolvePackageName(e.id, managerKey);
+      if (r && r.name === packageId) return e;
+    }
+  }
+  return null;
 }
 
 // Registry read that reports STATUS (unlike setup/registry.readRegistry,
@@ -224,6 +282,15 @@ function readRegistrySource(opts = {}) {
   } catch {
     return { ok: false, entries: [] };
   }
+}
+
+// Single-manager probe (Phase 4 auto-refresh after `u`): re-evaluates ONE
+// source — injections honored, real probes exec — and returns its entries.
+// Used by tool-actions.refreshEntryAfterUpdate; never throws.
+async function probeManager(key, opts = {}) {
+  const src = MANAGER_SOURCES.find(s => s.key === key);
+  if (!src) return { ok: false, entries: [] };
+  return evaluateSource(src, opts, opts.platform || process.platform);
 }
 
 async function scanInventory(opts = {}) {
@@ -268,13 +335,22 @@ async function scanInventory(opts = {}) {
   tick(); // step 1: registry
   for (const r of registrySource.entries) {
     if (!r || !r.id) continue;
+    // HEALING (owner fix): the registry can carry a method whose manager is
+    // absent on this machine (older installs recorded the catalog family —
+    // 'brew' — even when winget actually ran). Such a method falls back to
+    // the DETECTED system manager (u/r stay ACTIVE, running the manager that
+    // really owns the tool); null only when no system manager exists.
+    let manager = r.method || null;
+    if (manager && !managerAvailable(manager, { env, platform, statSync, accessSync })) {
+      manager = detectSystemManager({ env, platform, statSync, accessSync });
+    }
     byId.set(r.id, {
       id: r.id,
       name: r.name || r.id,
       version: null,
       binPath: null,
       source: 'adm',
-      manager: r.method || null,
+      manager,
       installedAt: r.installedAt || null,
     });
   }
@@ -291,7 +367,12 @@ async function scanInventory(opts = {}) {
   const mergeManagerEntries = (entries, src) => {
     for (const e of entries) {
       if (!e || !e.id) continue;
-      const existing = byId.get(e.id);
+      // Managers report PACKAGE ids ('Git.Git'), not tool ids ('git') — a
+      // manager entry also matches an EXISTING entry whose id resolves to
+      // that package for this manager (registry 'git' then receives winget's
+      // version/path, and no duplicate 'Git.Git' row appears in "system").
+      const existing = byId.get(e.id)
+        || findPackageMatch([...byId.values()], e.id, src.key);
       if (existing) {
         if (!existing.version && e.version) existing.version = e.version;
         if (!existing.binPath && e.binPath) existing.binPath = e.binPath;
@@ -361,4 +442,4 @@ async function scanInventory(opts = {}) {
   return { entries: groups.flatMap(g => g.entries), groups };
 }
 
-module.exports = { scanInventory, findOnPath };
+module.exports = { scanInventory, findOnPath, probeManager, managerAvailable, detectSystemManager };

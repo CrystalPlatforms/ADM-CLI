@@ -16,8 +16,9 @@
 
 const chalk = require('chalk');
 const { FRAMES } = require('../setup/loader');
-const { scanInventory } = require('./inventory');
+const { scanInventory, probeManager } = require('./inventory');
 const { getToolInfo } = require('./tool-info');
+const toolActions = require('./tool-actions');
 
 const FRAME_INTERVAL = 80; // same cadence as setup/loader.js
 
@@ -116,7 +117,9 @@ function buildView(result, selected, collapsed, focusInList = true) {
       for (const entry of g.entries) {
         const s = idx === selected && focusInList;
         const m = idx === selected;
-        rows.push(s ? chalk.red.bold(`> ${entry.name}`) : (m ? `> ${entry.name}` : `  ${entry.name}`));
+        // auto-refresh badge (#39): a just-updated entry shows the new state
+        const name = entry.updated ? `${entry.name} ${chalk.hex('#167c51')('✓')}` : entry.name;
+        rows.push(s ? chalk.red.bold(`> ${name}`) : (m ? `> ${name}` : `  ${name}`));
         selectable.push({ type: 'tool', id: entry.id, rowIndex: rows.length - 1 });
         idx += 1;
       }
@@ -125,9 +128,69 @@ function buildView(result, selected, collapsed, focusInList = true) {
   return { rows, selectable };
 }
 
+// Remove confirm dialog (#39, owner flow): full-frame modal in TWO stages —
+// "Are you sure? (y/n)", and after y a "User is sure: Yes ✓" line plus the
+// config/cache question in the same y/n form. n never executes anything.
+function buildDialog(d) {
+  const lines = [chalk.red.bold(`Remove ${d.name}?`), ''];
+  if (d.stage === 'sure') {
+    lines.push('Are you sure? (y/n)', '', chalk.dim('y yes · n no'));
+  } else {
+    lines.push(`User is sure: Yes ${chalk.hex('#167c51')('✓')}`);
+    lines.push('', 'Also remove config and cache? (y/n)', '', chalk.dim('y yes · n no'));
+  }
+  return lines;
+}
+
+// Action frame (#39/#40): the whole frame replaces the list while an action
+// runs/finishes. running = install-style line: loader frame + the live
+// command in parentheses + [elapsed] after 3s (owner decision, like the
+// adm install spinner). blocked = sudo failure → message + copyable command
+// + retry. A DONE frame auto-returns to the list after doneDelayMs; an
+// error frame STAYS until dismissed.
+const ACTION_LABELS = { update: 'Updating', remove: 'Removing', reveal: 'Opening' };
+
+function buildActionFrame(a, { columns = 80 } = {}) {
+  const label = ACTION_LABELS[a.kind] || a.kind;
+  if (a.status === 'running') {
+    const elapsed = Math.max(0, Math.floor((Date.now() - (a.startedAt || Date.now())) / 1000));
+    const time = elapsed >= 3 ? chalk.dim(` [${elapsed}s]`) : '';
+    const cmd = a.currentCommand || a.command || '';
+    return [clip(`${FRAMES[(a.frame || 0) % FRAMES.length]} ${label} ${a.name} (${cmd})${time}`, columns - 1)];
+  }
+  if (a.status === 'done') return [chalk.hex('#167c51')(`✓ ${a.message}`), '', chalk.dim('esc back')];
+  if (a.status === 'noop') return [chalk.yellow(`· ${a.message}`), '', chalk.dim('esc back')];
+  if (a.status === 'blocked') {
+    return [
+      chalk.yellow('⚠ administrator (sudo) rights are required'),
+      '',
+      'copy the command, run it in a terminal with elevated rights, then retry:',
+      '',
+      chalk.bold(a.command),
+      '',
+      chalk.dim('enter retry · esc back'),
+    ];
+  }
+  return [chalk.red(`✗ ${label} failed`), '', a.message, '', chalk.dim('esc back')];
+}
+
+// Terminal below ~80×24 (#40): a readable notice INSTEAD of any layout —
+// zero risk of a broken render. F5 rescans once the window grows.
+function buildMinSizeScreen(columns, rows) {
+  return [
+    '',
+    chalk.hex('#167c51').bold('terminal too small'),
+    '',
+    `adm tools needs at least 80×24 — current ${columns || '?'}×${rows || '?'}`,
+    '',
+    chalk.dim('enlarge the terminal window, then press F5 to rescan'),
+  ];
+}
+
 // Same key mapping contract as ink's useInput (whole-chunk matches).
 // F5 arrives as CSI 15~; Shift+R as a plain capital R. Lowercase r is
-// RESERVED for remove (Phase 4) — it must never trigger a rescan.
+// remove (opens the confirm dialog — #39); u/f/c trigger update/reveal.
+// Esc cancels a dialog / dismisses an action frame.
 function parseKey(chunk) {
   const input = String(chunk);
   return {
@@ -141,6 +204,13 @@ function parseKey(chunk) {
     ctrlC: input === '\u0003',
     f5: input === '\u001B[15~',
     shiftR: input === 'R',
+    esc: input === '\u001B',
+    u: input === 'u',
+    r: input === 'r',
+    f: input === 'f',
+    c: input === 'c',
+    y: input === 'y',
+    n: input === 'n',
   };
 }
 
@@ -150,14 +220,26 @@ function parseKey(chunk) {
 //   stdin        EventEmitter emitting 'data' (keys)
 //   onExit       () => void — called on q / Ctrl+C
 //   viewportRows number — window height override (tests); default rows - 3
-function createToolsApp({ scan, stdout, stdin, onExit, viewportRows, toolInfo: toolInfoOpt }) {
+//   toolInfo     entry => info bundle override (tests); default getToolInfo
+//   probe        (managerKey, opts) => { ok, entries } override (tests) — the
+//                light single-manager probe used by update auto-refresh
+//   execFunc     (cmd, opts, cb) => cb(err, stdout, stderr) override (tests) —
+//                executes action/reveal commands; default child_process.exec
+//   platform     platform override for reveal command generation (tests)
+function createToolsApp({ scan, stdout, stdin, onExit, viewportRows, toolInfo: toolInfoOpt, probe: probeOpt, execFunc: execFuncOpt, platform: platformOpt, doneDelayMs }) {
   const toolInfo = toolInfoOpt || getToolInfo;
+  const probe = probeOpt || probeManager;
+  const execFunc = execFuncOpt || ((cmd, o, cb) => require('child_process').exec(cmd, o, cb));
+  const platform = platformOpt || process.platform;
+  const DONE_DELAY = Number.isFinite(doneDelayMs) ? doneDelayMs : 3000; // done frame auto-return
   let progress = null;        // { done, total } | null
   let result = null;          // { entries, groups } | null
   let cursor = { selected: 0, top: 0 };
   let panelInfo = null;       // tool-info bundle for the SELECTED tool | null
   let focus = 'list';         // 'list' | 'buttons' — where the hover lives
   let buttonIdx = 0;          // hovered button when focus === 'buttons'
+  let dialog = null;          // { entryId, name, stage: 'sure'|'cache' } | null
+  let actionState = null;     // { kind, entryId, name, status, steps?, stepIndex?, command?, message?, startedAt?, frame?, currentCommand? } | null
   const collapsed = new Set();
   let frameTimer = null;
   let frame = 0;
@@ -205,6 +287,13 @@ function createToolsApp({ scan, stdout, stdin, onExit, viewportRows, toolInfo: t
 
   const render = () => {
     if (dead) return;
+    // #40: below ~80×24 the notice REPLACES every other frame (scan screen,
+    // list, dialogs) — no broken layout is ever drawn.
+    const tooSmall = (Number.isFinite(stdout.columns) && stdout.columns < 80)
+      || (Number.isFinite(stdout.rows) && stdout.rows < 24);
+    if (tooSmall) { paint(buildMinSizeScreen(stdout.columns, stdout.rows), false); return; }
+    if (dialog) { paint(buildDialog(dialog), false); return; }
+    if (actionState) { paint(buildActionFrame(actionState, { columns: stdout.columns || 80 }), false); return; }
     if (!result) {
       // scan screen: loader + counter, NO hint (owner request — the hint
       // appears only once the tool list is up)
@@ -339,12 +428,209 @@ function createToolsApp({ scan, stdout, stdin, onExit, viewportRows, toolInfo: t
       .then(applyResult);
   };
 
+  // ── actions (#39 u/r, #40 f/c) ──────────────────────────────────────────
+  // Flag-gated: a dimmed shortcut executes NOTHING. runPlan executes the
+  // plan, then auto-refreshes (remove → entry vanishes; update → light
+  // single-manager probe + updated badge) and reports done/blocked/failed.
+
+  let actionTimer = null;   // loader animation while an action runs
+  let doneTimer = null;     // done frame auto-return
+
+  const stopActionTimer = () => {
+    if (actionTimer) { clearInterval(actionTimer); actionTimer = null; }
+  };
+
+  const startActionTimer = () => {
+    stopActionTimer();
+    actionTimer = setInterval(() => {
+      if (!actionState || actionState.status !== 'running') { stopActionTimer(); return; }
+      actionState.frame = (actionState.frame || 0) + 1;
+      render(); // re-reads startedAt → elapsed seconds refresh too
+    }, FRAME_INTERVAL);
+  };
+
+  const clearDoneTimer = () => {
+    if (doneTimer) { clearTimeout(doneTimer); doneTimer = null; }
+  };
+
+  const currentEntry = () => {
+    if (!result || !panelInfo) return null;
+    return result.entries.find(e => e.id === panelInfo.id) || null;
+  };
+
+  // after a remove the selectable list shrank — clamp cursor + window, then
+  // recompute the panel (the selection now sits on a different row)
+  const clampAfterMutation = () => {
+    if (!result) { refreshPanel(); render(); return; }
+    const { selectable } = buildView(result, cursor.selected, collapsed);
+    const len = selectable.length;
+    if (len === 0) { cursor = { selected: 0, top: 0 }; } else {
+      cursor.selected = clampIdx(cursor.selected, len);
+      if (cursor.selected < cursor.top) cursor.top = cursor.selected;
+      else if (cursor.selected >= cursor.top + height()) cursor.top = Math.max(0, cursor.selected - height() + 1);
+    }
+    refreshPanel();
+    render();
+  };
+
+  const finishOk = async (kind, entry) => {
+    if (result) {
+      if (kind === 'remove') {
+        toolActions.applyActionToResult(result, entry.id, 'remove');
+        clampAfterMutation();
+        return; // clampAfterMutation already rendered
+      }
+      if (kind === 'update') {
+        await toolActions.refreshEntryAfterUpdate(result, entry.id, entry.manager, { probe });
+        refreshPanel(); // the panel re-reads the (version-refreshed) entry
+      }
+    }
+    render();
+  };
+
+  const runPlan = (kind, entry, steps, fromIndex = 0) => {
+    if (!steps || fromIndex >= steps.length) return;
+    clearDoneTimer();
+    actionState = {
+      kind, entryId: entry.id, name: entry.name, status: 'running',
+      steps, stepIndex: fromIndex, startedAt: Date.now(), frame: 0, currentCommand: null,
+    };
+    startActionTimer();
+    render();
+    Promise.resolve()
+      .then(() => toolActions.runActionPlan(steps.slice(fromIndex), {
+        execFunc,
+        onStep: (step) => {
+          if (!actionState || actionState.status !== 'running') return;
+          actionState.currentCommand = step.command || `clean ${step.path}`;
+          render();
+        },
+      }))
+      .then(async res => {
+        stopActionTimer();
+        // the manager does not own this package (bundled installs) and no
+        // binary fallback exists — the entry STAYS and the frame STAYS (it is
+        // an error-like state: no 3s auto-return, owner decision)
+        if (res.ok && res.noop === 'not-managed') {
+          actionState = {
+            kind, entryId: entry.id, name: entry.name, status: 'noop',
+            message: `Not managed by ${entry.manager || 'this manager'} — nothing removed`,
+          };
+          render();
+          return;
+        }
+        if (res.ok) {
+          actionState = {
+            kind, entryId: entry.id, name: entry.name, status: 'done',
+            message: kind === 'remove' ? `Removed ${entry.name}`
+              : kind === 'update' ? (res.noop ? `Already up to date — ${entry.name}` : `Updated ${entry.name}`)
+                : 'Opened folder',
+          };
+          await finishOk(kind, entry);
+          // owner flow: a successful action returns to the list after 3s —
+          // an error (failed/blocked) frame stays until dismissed
+          clearDoneTimer();
+          doneTimer = setTimeout(() => {
+            doneTimer = null;
+            if (actionState && actionState.status === 'done') { actionState = null; render(); }
+          }, DONE_DELAY);
+          return;
+        }
+        if (res.sudoFailure) {
+          const absIdx = fromIndex + res.stepIndex;
+          actionState = {
+            kind, entryId: entry.id, name: entry.name, status: 'blocked',
+            steps, stepIndex: absIdx,
+            command: res.command || (steps[absIdx] && steps[absIdx].command),
+            message: 'administrator (sudo) rights are required',
+          };
+          render();
+          return;
+        }
+        actionState = {
+          kind, entryId: entry.id, name: entry.name, status: 'failed',
+          message: String((res.stderr && res.stderr.trim()) || (res.stdout && res.stdout.trim()) || (res.err && res.err.message) || 'command failed')
+            .split('\n').slice(-4).join('\n'),
+        };
+        render();
+      });
+  };
+
+  const tryUpdate = () => {
+    if (!panelInfo || !panelInfo.flags || !panelInfo.flags.canUpdate) return;
+    const entry = currentEntry();
+    if (!entry) return;
+    runPlan('update', entry, toolActions.buildActionPlan('update', entry, panelInfo));
+  };
+
+  const openRemoveDialog = () => {
+    if (!panelInfo || !panelInfo.flags || !panelInfo.flags.canRemove) return;
+    if (!currentEntry()) return;
+    dialog = { entryId: panelInfo.id, name: panelInfo.name, stage: 'sure' };
+    render();
+  };
+
+  const confirmRemove = (includeConfigCache) => {
+    const d = dialog;
+    const entry = currentEntry();
+    dialog = null;
+    if (!d || !entry || entry.id !== d.entryId) { render(); return; }
+    runPlan('remove', entry, toolActions.buildActionPlan('remove', entry, panelInfo, { includeConfigCache }));
+  };
+
+  const tryReveal = (which) => {
+    if (!panelInfo || !panelInfo.flags || !panelInfo.flags.canReveal) return;
+    const target = which === 'cache' ? panelInfo.cachePaths && panelInfo.cachePaths[0] : panelInfo.binPath;
+    if (!target) return;
+    if (which === 'cache' && !panelInfo.flags.hasCache) return;
+    const command = toolActions.buildRevealCommand(platform, target);
+    if (!command) return;
+    const entry = currentEntry() || { id: panelInfo.id, name: panelInfo.name, manager: null };
+    // tolerant: explorer/open/xdg-open exit non-zero on success sometimes —
+    // the folder opens, that is all reveal promises
+    runPlan('reveal', entry, [{ type: 'command', command, label: `reveal ${target}`, tolerant: true }]);
+  };
+
+  // sudo blocked → enter retries: re-runs the SAME plan from the failed step
+  // (retry always repeats exactly the command that failed)
+  const retryAction = () => {
+    const a = actionState;
+    if (!a || a.status !== 'blocked') return;
+    const entry = (result && result.entries.find(e => e.id === a.entryId))
+      || { id: a.entryId, name: a.name, manager: null };
+    runPlan(a.kind, entry, a.steps, a.stepIndex);
+  };
+
+  const dismissAction = () => { clearDoneTimer(); actionState = null; render(); };
+
   const onData = (chunk) => {
     if (dead) return;
     const key = parseKey(chunk);
     if (key.q || key.ctrlC) {
       stop();
       if (onExit) onExit();
+      return;
+    }
+    // MODALS first: while a dialog or an action frame is up, every other key
+    // is consumed here — nothing underneath can fire.
+    if (dialog) {
+      if (dialog.stage === 'sure') {
+        if (key.y) { dialog.stage = 'cache'; render(); }
+        else if (key.n) { dialog = null; render(); }
+      } else if (dialog.stage === 'cache') {
+        if (key.y) confirmRemove(true);
+        else if (key.n) confirmRemove(false);
+      }
+      return;
+    }
+    if (actionState) {
+      if (actionState.status === 'running') return; // locked while executing
+      if (actionState.status === 'blocked') {
+        if (key.enter) retryAction();
+        else if (key.esc) dismissAction();
+        return;
+      }
+      if (key.esc || key.enter || key.space) dismissAction();
       return;
     }
     // ENABLED buttons only — the hover never rests on a dimmed one; with all
@@ -375,17 +661,35 @@ function createToolsApp({ scan, stdout, stdin, onExit, viewportRows, toolInfo: t
       }
     } else if (key.left) {
       if (focus === 'buttons') { focus = 'list'; render(); }
+    } else if (key.u) {
+      tryUpdate();
+    } else if (key.r) {
+      openRemoveDialog();
+    } else if (key.f) {
+      tryReveal('folder');
+    } else if (key.c) {
+      tryReveal('cache');
     } else if (key.enter || key.space) {
-      if (focus === 'list') toggle(); // Enter on a button = Phase 4 action
+      if (focus === 'buttons') {
+        const b = BUTTONS[buttonIdx];
+        if (panelInfo && panelInfo.flags && panelInfo.flags[b.flag]) {
+          if (b.key === 'u') tryUpdate();
+          else if (b.key === 'r') openRemoveDialog();
+          else tryReveal(b.key === 'c' ? 'cache' : 'folder');
+        }
+      } else {
+        toggle();
+      }
     } else if (key.f5 || key.shiftR) {
       rescan();
     }
-    // lowercase r: intentionally unbound (remove in Phase 4)
   };
 
   const stop = () => {
     if (dead) return;
     dead = true;
+    stopActionTimer();
+    clearDoneTimer();
     if (frameTimer) clearInterval(frameTimer);
     stdin.removeListener('data', onData);
     // leave raw mode / stop consuming the stream (real terminal stdin only)
@@ -449,4 +753,4 @@ async function runToolsTui(opts = {}) {
   return 0;
 }
 
-module.exports = { createToolsApp, runToolsTui, buildView, buildPanel };
+module.exports = { createToolsApp, runToolsTui, buildView, buildPanel, buildDialog, buildActionFrame, buildMinSizeScreen };

@@ -95,6 +95,19 @@ describe('parseCargoInstallList (cargo install --list)', () => {
     ]);
   });
 
+  test('parses --path/--git installs: "crate vV (source):" — real Windows output shape', () => {
+    const raw = [
+      'umux v1.0.2 (C:\\Users\\panad\\Documents\\umux\\src-tauri\\cli):',
+      '    umux.exe',
+      'tool v2.0.0 (git+https://github.com/x/y#abc123):',
+      '    tool',
+    ].join('\r\n');
+    expect(parseCargoInstallList(raw)).toEqual([
+      { id: 'umux', name: 'umux', version: '1.0.2', binPath: null },
+      { id: 'tool', name: 'tool', version: '2.0.0', binPath: null },
+    ]);
+  });
+
   test('no crates installed is a valid empty list', () => {
     expect(parseCargoInstallList('')).toEqual([]);
   });

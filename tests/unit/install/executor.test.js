@@ -219,6 +219,30 @@ describe('executor.executeInstall', () => {
     ]);
   });
 
+  test('onInstalled records the EFFECTIVE installer: manager wins over the catalog family', async () => {
+    // git carries the catalog family method 'brew', but the plan ran winget —
+    // the registry must record 'winget' (tools TUI would otherwise offer
+    // `brew uninstall git` on machines without brew)
+    const installed = [];
+    const exec = (command, opts, cb) => {
+      if (/command -v|where /.test(command)) return cb({ code: 1 }, '', ''); // probe misses (win32 translates to `where`)
+      cb(null, 'ok', '');
+    };
+    const entries = [
+      { id: 'git', name: 'Git', method: 'brew', status: 'planned', statusSource: 'command -v git',
+        command: 'winget install --id Git.Git --exact', manager: 'winget', package: 'Git.Git' },
+      { ...NPM_ENTRY, id: 'a', name: 'Tool A' }, // npm method, no manager → family wins
+    ];
+    await executeInstall(entries, {
+      execFunc: exec, platform: 'win32', npmPrefixRepair: false, fs: { accessSync: () => { throw new Error('none'); } },
+      onInstalled: async e => installed.push(e),
+    });
+    expect(installed).toEqual([
+      { id: 'git', name: 'Git', method: 'winget' },
+      { id: 'a', name: 'Tool A', method: 'npm' },
+    ]);
+  });
+
   test('mixed outcomes are counted (installed/skipped/failed)', async () => {
     const exec = (command, opts, cb) => {
       if (/command -v a/.test(command) || /command -v c/.test(command)) return cb({ code: 1 }, '', '');

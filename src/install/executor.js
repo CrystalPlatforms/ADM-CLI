@@ -234,7 +234,11 @@ async function executeInstall(entries, opts = {}) {
     }
     if (result.status === 'installed' && onInstalled) {
       try {
-        await onInstalled({ id: entry.id, name: entry.name, method: entry.method });
+        // Registry records what ACTUALLY drove the install: a manager-backed
+        // plan runs env.manager (winget on Windows) while entry.method keeps
+        // the catalog family ('brew') — recording the family made the tools
+        // TUI offer `brew uninstall git` on machines without brew.
+        await onInstalled({ id: entry.id, name: entry.name, method: entry.manager || entry.method });
       } catch { /* registry must never break an install */ }
     }
     onProgress({ tool: entry, result });

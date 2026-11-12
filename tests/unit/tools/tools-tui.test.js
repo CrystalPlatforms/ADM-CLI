@@ -59,6 +59,7 @@ const linesOf = frame => frame.split('\n').map(l => l.split('│')[0].replace(/^
 const scanFixtures = onProgress => {
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'adm-tui-path-'));
   fs.writeFileSync(path.join(binDir, 'fzf'), '#!/bin/sh\n'); // PATH-only hit → 'other'
+  fs.writeFileSync(path.join(binDir, 'npm'), '#!/bin/sh\n'); // registry method stays reachable (healing keeps 'npm')
   const goBin = fs.mkdtempSync(path.join(os.tmpdir(), 'adm-tui-gobin-'));
   return scanInventory({
     registry: [{ id: 'typescript', name: 'TypeScript', method: 'npm', installedAt: '2026-01-01T00:00:00.000Z' }],
@@ -177,7 +178,7 @@ describe('tools TUI (skin)', () => {
     expect(lines.some(l => l.includes('↑↓ move') && l.includes('q quit'))).toBe(true);
   });
 
-  test('a failed source renders an empty group with its warning row', async () => {
+  test('a failed ADM registry renders its warning row; a MISSING manager stays silent (hidden)', async () => {
     const scan = onProgress => scanInventory({
       // no registry fixture → real read path: missing file → warning (as in production)
       configDir: fs.mkdtempSync(path.join(os.tmpdir(), 'adm-tui-empty-')),
@@ -190,11 +191,11 @@ describe('tools TUI (skin)', () => {
     await flush();
 
     const frame = screenText(t.stdout);
-    // warning-carrying groups stay visible even when empty — the ⚠ explains why
+    // the ADM registry is adm's own bookkeeping — missing it warns
     expect(frame).toContain('ADM (0)');
-    expect(frame).toContain('npm (0)');
-    expect(frame).toContain('npm not found — global packages not scanned');
-    // empty without warning → hidden
+    expect(frame).toContain('ADM registry not found — ADM-installed tools not listed');
+    // a MISSING manager is normal (owner policy) — empty AND silent → hidden
+    expect(frame).not.toContain('npm (0)');
     expect(frame).not.toContain('brew (0)');
   });
 
@@ -878,5 +879,428 @@ describe('tools TUI (skin)', () => {
     const sparseJoined = sparse.join('\n');
     const gapCount = sparseJoined.split('—').length - 1;
     expect(gapCount).toBe(7); // version, path, method, size, config, cache, docs
+  });
+});
+
+// ── #39/#40: actions (u/r), sudo state machine, auto-refresh, reveal (f/c),
+// terminal-too-small screen.
+//
+// Assumptions encoded by these tests (stated before RED, 2026-11-12):
+// - `r` opens a FULL-FRAME confirm dialog in TWO y/n stages: "Are you sure?
+//   (y/n)" → after y "User is sure: Yes ✓" + "Also remove config and cache?
+//   (y/n)". n NEVER executes anything; other keys are swallowed while the
+//   dialog is up.
+// - While running, the frame is install-style: dots_12 loader frame +
+//   "Removing/Updating <name> (<live command>)" + [elapsed] after 3s.
+// - A DONE frame ("✓ Removed X") auto-returns to the list after doneDelayMs
+//   (3s in production); a FAILED frame STAYS until esc.
+// - Sudo state machine: a command failing with permission-shaped stderr
+//   (sudo:, lock files, denials) → "blocked" frame carrying the copyable
+//   command; ENTER retries the EXACT same command; esc dismisses.
+// - Auto-refresh WITHOUT rescan: after remove the entry vanishes from the
+//   rendered list; after update the row shows the ✓ badge and the panel
+//   shows the probed new version (light single-manager probe — the scan
+//   function is NOT called again).
+// - Reveal (f/c) executes the platform command ONLY behind canReveal
+//   (+ hasCache for c); it is TOLERANT — explorer exits 1 on success, so a
+//   non-zero reveal exit still lands as done. A headless canReveal:false
+//   leaves f/c inert — zero exec calls even from the buttons focus.
+// - stdout below 80×24 renders the "terminal too small" screen INSTEAD of
+//   any list/modal frame — from the very first frame (scan screen included).
+describe('tools TUI actions (Phase 4 + 5)', () => {
+  let app;
+  afterEach(() => { if (app) { app.stop(); app = null; } });
+
+  const actionInfo = entry => ({
+    id: entry.id, name: entry.name,
+    version: entry.version || '5.4.5', binPath: `/usr/bin/${entry.id}`, method: 'npm',
+    size: 1024, sizeLabel: '1.0 KB',
+    configPaths: [`~/.config/${entry.id}`], cachePaths: [`~/.cache/${entry.id}`], docsPaths: [],
+    flags: { canUpdate: true, canRemove: true, hasCache: true, canReveal: true },
+  });
+
+  const mountActions = (props = {}) => {
+    const stdout = fakeStdout();
+    const inDev = fakeStdin();
+    const execCalls = [];
+    app = createToolsApp({
+      scan: scanFixtures,
+      stdout,
+      stdin: inDev.stdin,
+      onExit: () => {},
+      toolInfo: actionInfo,
+      execFunc: (cmd, _o, cb) => { execCalls.push(cmd); cb(null, '', ''); },
+      ...props,
+    });
+    app.run();
+    return { stdout, inDev, execCalls };
+  };
+
+  // selection onto the first TOOL row (TypeScript) — flags all enabled
+  const selectTool = async t => {
+    await flush();
+    await flush();
+    t.inDev.press('\x1b[B'); // ADM header → TypeScript
+  };
+
+  test('dialog without confirmation executes NOTHING (n cancels; other keys are swallowed)', async () => {
+    const t = mountActions({ doneDelayMs: 10 });
+    await selectTool(t);
+    t.inDev.press('r');
+    expect(screenText(t.stdout)).toContain('Remove TypeScript?');
+    expect(screenText(t.stdout)).toContain('Are you sure? (y/n)');
+    expect(t.execCalls).toEqual([]);
+
+    t.inDev.press('n'); // no → back to the list, zero execution
+    await flush();
+    expect(t.execCalls).toEqual([]);
+    expect(screenText(t.stdout)).toContain('TypeScript'); // back on the list
+
+    // keys that belong to the list do nothing while the dialog is up
+    t.inDev.press('r'); // dialog again…
+    t.inDev.press('u'); // …and everything but y/n is swallowed
+    t.inDev.press('f');
+    t.inDev.press('\u001B[C');
+    await flush();
+    expect(t.execCalls).toEqual([]);
+    expect(screenText(t.stdout)).toContain('Are you sure?'); // dialog untouched
+    expect(screenText(t.stdout)).not.toContain('User is sure');
+    t.inDev.press('n'); // cancel
+    await flush();
+    expect(t.execCalls).toEqual([]);
+    expect(screenText(t.stdout)).not.toContain('Are you sure?');
+  });
+
+  test('r → y shows "User is sure: Yes ✓" + the cache question; n skips cleanup', async () => {
+    const t = mountActions({ doneDelayMs: 30000 });
+    await selectTool(t);
+    t.inDev.press('r');
+    t.inDev.press('y');
+    const stage2 = screenText(t.stdout);
+    expect(stage2).toContain('User is sure: Yes ✓');
+    expect(stage2).toContain('Also remove config and cache? (y/n)');
+
+    t.inDev.press('n'); // confirm WITHOUT the config/cache cleanup
+    await flush(); // the plan starts on the next microtask
+    expect(t.execCalls).toEqual(['npm uninstall -g typescript']);
+    await flush(); await flush(); await flush();
+    expect(screenText(t.stdout)).toContain('✓ Removed TypeScript');
+  });
+
+  test('r → y → y confirms WITH the config/cache cleanup; done auto-returns to the list', async () => {
+    const t = mountActions({ doneDelayMs: 10 });
+    await selectTool(t);
+    t.inDev.press('r');
+    t.inDev.press('y');
+    t.inDev.press('y'); // cleanup ON
+    await flush();
+    expect(t.execCalls).toEqual(['npm uninstall -g typescript']);
+
+    await flush(); await flush(); await flush();
+    expect(screenText(t.stdout)).toContain('✓ Removed TypeScript');
+
+    // done frame auto-returns to the main TUI after doneDelayMs (10 ms here)
+    await new Promise(r => setTimeout(r, 40));
+    const frame = screenText(t.stdout);
+    expect(frame).not.toContain('Removed TypeScript'); // back to the list
+    expect(frame).not.toContain('TypeScript'); // gone — no manual rescan
+    expect(frame).toContain('eslint');         // the rest of the list survives
+  });
+
+  test('while running: install-style line — loader frame, Removing X (command) [elapsed]', async () => {
+    const t = mountActions({
+      doneDelayMs: 10,
+      execFunc: (_cmd, _o, cb) => setTimeout(() => cb(null, '', ''), 30), // keep it running
+    });
+    await selectTool(t);
+    t.inDev.press('r');
+    t.inDev.press('y');
+    t.inDev.press('n');
+    await flush(); await flush();
+    const running = screenText(t.stdout);
+    expect(FRAMES.some(f => running.includes(f))).toBe(true); // loader animates
+    expect(running).toContain('Removing TypeScript');         // capital R
+    expect(running).toContain('(npm uninstall -g typescript)'); // live command
+
+    await new Promise(r => setTimeout(r, 60)); // let it finish (and auto-return)
+    expect(screenText(t.stdout)).not.toContain('Removing TypeScript');
+  });
+
+  test('sudo failure → blocked frame with the copyable command; retry repeats the SAME command', async () => {
+    const sudoErr = { message: 'Command failed', stderr: 'sudo: a password is required' };
+    let calls = 0;
+    const t = mountActions({
+      doneDelayMs: 10,
+      execFunc: (cmd, _o, cb) => {
+        calls += 1;
+        if (calls === 1) cb(sudoErr, '', sudoErr.stderr);
+        else cb(null, '', '');
+      },
+    });
+    await selectTool(t);
+    t.inDev.press('r');
+    t.inDev.press('y');
+    t.inDev.press('n');
+    await flush(); await flush(); await flush();
+
+    const blocked = screenText(t.stdout);
+    expect(blocked).toContain('administrator (sudo) rights are required');
+    expect(blocked).toContain('npm uninstall -g typescript'); // copyable command
+    expect(blocked).toContain('enter retry');
+
+    t.inDev.press('\r'); // retry
+    await flush(); await flush(); await flush();
+    expect(screenText(t.stdout)).toContain('✓ Removed TypeScript');
+    t.inDev.press('\u001B');
+    expect(screenText(t.stdout)).not.toContain('TypeScript');
+  });
+
+  test('a non-sudo failure lands in the failed frame and STAYS (no auto-return)', async () => {
+    const t = mountActions({
+      doneDelayMs: 10,
+      execFunc: (_cmd, _o, cb) => cb({ message: 'npm ERR! enoent', stderr: 'npm ERR! enoent' }, '', 'npm ERR! enoent'),
+    });
+    await selectTool(t);
+    t.inDev.press('r');
+    t.inDev.press('y');
+    t.inDev.press('n');
+    await flush(); await flush(); await flush();
+    expect(screenText(t.stdout)).toContain('✗ Removing failed');
+    expect(screenText(t.stdout)).toContain('npm ERR! enoent');
+
+    // errors do NOT auto-return — the frame stays well past doneDelayMs
+    await new Promise(r => setTimeout(r, 40));
+    expect(screenText(t.stdout)).toContain('✗ Removing failed');
+
+    t.inDev.press('\u001B');
+    expect(screenText(t.stdout)).toContain('TypeScript'); // untouched
+  });
+
+  test('update (u) refreshes the row: ✓ badge + probed new version in the panel — scan NOT re-run', async () => {
+    let scans = 0;
+    const scan = onProgress => { scans += 1; return scanFixtures(onProgress); };
+    const versionedInfo = e => ({ ...actionInfo(e), version: e.version || '5.4.5' });
+    const t = mountActions({
+      scan,
+      doneDelayMs: 30000,
+      toolInfo: versionedInfo,
+      probe: async () => ({ ok: true, entries: [{ id: 'typescript', version: '9.9.9' }] }),
+    });
+    await selectTool(t);
+    t.inDev.press('u'); // direct shortcut — update runs WITHOUT a dialog
+    await flush(); await flush(); await flush();
+    expect(t.execCalls).toEqual(['npm update -g typescript']);
+    expect(screenText(t.stdout)).toContain('✓ Updated TypeScript');
+    expect(scans).toBe(1); // auto-refresh is NOT a rescan
+
+    t.inDev.press('\u001B');
+    const frame = screenText(t.stdout);
+    expect(frame).toContain('TypeScript ✓'); // row shows the new state
+    expect(frame).toContain('9.9.9');        // panel shows the probed version
+  });
+
+  test('update retry after a sudo block also refreshes the row', async () => {
+    const sudoErr = { message: 'Command failed', stderr: 'E: Could not open lock file - Permission denied' };
+    let calls = 0;
+    const versionedInfo = e => ({ ...actionInfo(e), version: e.version || '5.4.5' });
+    const t = mountActions({
+      toolInfo: versionedInfo,
+      doneDelayMs: 30000,
+      probe: async () => ({ ok: true, entries: [{ id: 'typescript', version: '9.9.9' }] }),
+      execFunc: (cmd, _o, cb) => {
+        calls += 1;
+        if (calls === 1) cb(sudoErr, '', sudoErr.stderr);
+        else cb(null, '', '');
+      },
+    });
+    await selectTool(t);
+    t.inDev.press('u');
+    await flush(); await flush();
+    expect(screenText(t.stdout)).toContain('administrator (sudo) rights are required');
+    t.inDev.press('\r'); // retry
+    await flush(); await flush(); await flush();
+    t.inDev.press('\u001B');
+    expect(screenText(t.stdout)).toContain('TypeScript ✓');
+  });
+
+  test('update on an ALREADY-LATEST tool (winget no-upgrade exit) lands as "Already up to date"', async () => {
+    const stderr = 'No available upgrade found.\nNo newer package versions are available from the configured sources.';
+    const t = mountActions({
+      doneDelayMs: 30000,
+      probe: async () => ({ ok: true, entries: [{ id: 'typescript', version: '5.4.5' }] }),
+      execFunc: (_cmd, _o, cb) => cb({ message: `Command failed: winget upgrade\n${stderr}`, stderr }, '', stderr),
+    });
+    await selectTool(t);
+    t.inDev.press('u');
+    await flush(); await flush(); await flush();
+    const frame = screenText(t.stdout);
+    expect(frame).toContain('✓ Already up to date — TypeScript'); // NOT "Updating failed"
+    t.inDev.press('\u001B');
+    expect(screenText(t.stdout)).toContain('TypeScript'); // entry untouched
+  });
+
+  test('remove NOT owned by the manager AND no known binary → "nothing removed", frame STAYS', async () => {
+    // Git-LFS-like: winget owns nothing AND no binPath to fall back to
+    const noBinInfo = e => ({ ...actionInfo(e), binPath: null });
+    const t = mountActions({
+      toolInfo: noBinInfo,
+      execFunc: (_cmd, _o, cb) => cb(
+        { message: 'Command failed: winget uninstall' },
+        'No installed package found matching input criteria.',
+        '',
+      ),
+    });
+    await selectTool(t);
+    t.inDev.press('r');
+    t.inDev.press('y');
+    t.inDev.press('n');
+    await flush(); await flush(); await flush();
+    expect(screenText(t.stdout)).toContain('· Not managed by npm — nothing removed');
+
+    // error-like state: NO 3s auto-return (owner decision) — stays until esc
+    await new Promise(r => setTimeout(r, 40));
+    expect(screenText(t.stdout)).toContain('· Not managed by npm — nothing removed');
+
+    t.inDev.press('\u001B');
+    expect(screenText(t.stdout)).toContain('TypeScript'); // entry untouched
+  });
+
+  test('remove NOT owned by the manager falls back to deleting the ADM-known binary', async () => {
+    // the tool shows in ADM with a REAL binPath (scan) — winget disowns it,
+    // ADM removes the binary it knows
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'adm-tui-fallback-'));
+    const bin = path.join(dir, 'git-lfs.exe');
+    fs.writeFileSync(bin, 'x');
+    const binInfo = e => ({ ...actionInfo(e), binPath: bin });
+    const scan = async onProgress => {
+      const res = await scanFixtures(onProgress);
+      const entry = res.entries.find(x => x.id === 'typescript');
+      if (entry) entry.binPath = bin; // the catalog PATH scan fills binPath
+      return res;
+    };
+    const t = mountActions({
+      scan,
+      toolInfo: binInfo,
+      execFunc: (_cmd, _o, cb) => cb(
+        { message: 'Command failed: winget uninstall' },
+        'No installed package found matching input criteria.',
+        '',
+      ),
+    });
+    await selectTool(t);
+    t.inDev.press('r');
+    t.inDev.press('y');
+    t.inDev.press('n');
+    await flush(); await flush(); await flush(); await flush();
+    expect(fs.existsSync(bin)).toBe(false);   // the binary is gone
+    expect(screenText(t.stdout)).toContain('✓ Removed TypeScript');
+    t.inDev.press('\u001B');
+    expect(screenText(t.stdout)).not.toContain('TypeScript'); // entry vanishes
+  });
+
+  test('reveal: f opens the tool folder, c the cache folder — the platform command per path', async () => {
+    // REAL paths: reveal resolves targets against the actual filesystem
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'adm-tui-rev-'));
+    const bin = path.join(dir, 'typescript'); // a FILE — linux opens its parent
+    fs.writeFileSync(bin, 'x');
+    const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'adm-tui-revc-'));
+    const platform = process.platform;
+    const expectCmd = target => (platform === 'win32'
+      ? `explorer /select,"${target}"`
+      : platform === 'darwin' ? `open -R "${target}"` : `xdg-open "${path.dirname(target)}"`);
+    const revInfo = e => ({ ...actionInfo(e), binPath: bin, cachePaths: [cacheDir] });
+    const t = mountActions({ platform, doneDelayMs: 30000, toolInfo: revInfo });
+    await selectTool(t);
+    t.inDev.press('f');
+    await flush(); // the plan starts on the next microtask
+    expect(t.execCalls).toEqual([expectCmd(bin)]);
+    await flush(); await flush();
+    expect(screenText(t.stdout)).toContain('✓ Opened folder');
+
+    t.inDev.press('\u001B'); // dismiss done frame
+    t.inDev.press('c');
+    await flush();
+    expect(t.execCalls).toEqual([expectCmd(bin), expectCmd(cacheDir)]);
+  });
+
+  test('reveal is TOLERANT: explorer exiting 1 after a successful open still lands as done', async () => {
+    const t = mountActions({
+      platform: 'win32',
+      doneDelayMs: 30000,
+      execFunc: (_cmd, _o, cb) => cb({ message: 'Command failed: explorer', stderr: '' }, '', ''),
+    });
+    await selectTool(t);
+    t.inDev.press('f');
+    await flush(); await flush(); await flush();
+    expect(screenText(t.stdout)).toContain('✓ Opened folder'); // NOT failed
+  });
+
+  test('headless (canReveal false) → f/c are inert: zero exec calls, also from the buttons focus', async () => {
+    const headlessInfo = e => ({
+      ...actionInfo(e),
+      flags: { canUpdate: true, canRemove: false, hasCache: true, canReveal: false },
+    });
+    const t = mountActions({ toolInfo: headlessInfo });
+    await selectTool(t);
+    t.inDev.press('f');
+    t.inDev.press('c');
+    expect(t.execCalls).toEqual([]);
+
+    // buttons focus: → lands on the first ENABLED button (u); ↓ cycles to (c)
+    // — enabled by hasCache but a cache reveal still needs canReveal: enter
+    // must NOT execute anything
+    t.inDev.press('\u001B[C'); // → buttons (hover: u)
+    t.inDev.press('\x1b[B'); await flush(); // cycle enabled [u, c] → hover c
+    t.inDev.press('\r');
+    await flush();
+    expect(t.execCalls).toEqual([]);
+    expect(screenText(t.stdout)).toContain('eslint'); // never left the list
+  });
+
+  test('dimmed flags (all false) make u/r/f/c and → inert — no dialog, no execution', async () => {
+    const sparse = e => ({ ...actionInfo(e), flags: { canUpdate: false, canRemove: false, hasCache: false, canReveal: false } });
+    const t = mountActions({ toolInfo: sparse });
+    await selectTool(t);
+    t.inDev.press('u');
+    t.inDev.press('r');
+    t.inDev.press('f');
+    t.inDev.press('c');
+    t.inDev.press('\u001B[C'); // → with all dimmed stays on the list
+    await flush();
+    expect(t.execCalls).toEqual([]);
+    expect(screenText(t.stdout)).not.toContain('Remove');
+  });
+
+  test('terminal below 80×24 shows ONLY the min-size screen — scan screen included, keys safe', async () => {
+    const stdout = fakeStdout();
+    stdout.columns = 70; // < 80 → too small
+    const inDev = fakeStdin();
+    let exited = false;
+    app = createToolsApp({ scan: scanFixtures, stdout, stdin: inDev.stdin, onExit: () => { exited = true; } });
+    app.run();
+    await flush(); await flush(); // scan resolved behind the gate
+
+    const frame = screenText(stdout);
+    expect(frame).toContain('terminal too small');
+    expect(frame).toContain('80×24');
+    expect(frame).not.toContain('ADM');      // no list ever rendered
+    expect(frame).not.toContain(FRAMES[0]);  // not even the scan loader
+
+    inDev.press('\x1b[B'); // keys must not crash the gate
+    inDev.press('r');
+    expect(screenText(stdout)).toContain('terminal too small');
+    expect(exited).toBe(false);
+    inDev.press('q');
+    expect(exited).toBe(true);
+  });
+
+  test('stdout taller than 24 but narrower than 80 → still the min-size screen', () => {
+    const stdout = fakeStdout();
+    stdout.rows = 30;
+    stdout.columns = 79;
+    const inDev = fakeStdin();
+    app = createToolsApp({ scan: scanFixtures, stdout, stdin: inDev.stdin });
+    app.run();
+    expect(screenText(stdout)).toContain('terminal too small');
   });
 });

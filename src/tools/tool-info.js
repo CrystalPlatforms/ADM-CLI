@@ -1,7 +1,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { findOnPath } = require('./inventory');
+const { findOnPath, managerAvailable } = require('./inventory');
 
 // tool-info (plan plans/adm-tools-tui.md, Phase 3, #38) — terminal-neutral
 // data module behind the `adm tools` side panel. ONE deep call:
@@ -75,6 +75,59 @@ function existingAmong(candidates, { fs: fsMod = fs } = {}) {
   });
 }
 
+// Well-known REAL locations for popular tools (owner fix: the generic
+// per-id conventions rarely match actual apps, so config/cache rendered
+// "—" almost everywhere). Paths are relative to the home directory.
+// WELL-KNOWN candidates come FIRST; only existing paths survive (the same
+// existingAmong gate as the generic ones — we never invent a location).
+const WELL_KNOWN = {
+  git: {
+    config: { default: ['.gitconfig'], win32: ['.gitconfig', 'AppData/Roaming/git/config'] },
+  },
+  gh: {
+    config: {
+      win32: ['AppData/Roaming/GitHub CLI'],
+      darwin: ['.config/gh'],
+      linux: ['.config/gh'],
+    },
+  },
+  npm: {
+    config: { default: ['.npmrc'] },
+    cache: {
+      win32: ['AppData/Local/npm-cache'],
+      default: ['.npm'],
+    },
+  },
+  pip: {
+    config: {
+      win32: ['AppData/Roaming/pip/pip.ini'],
+      default: ['.config/pip/pip.conf'],
+    },
+    cache: {
+      win32: ['AppData/Local/pip/cache'],
+      darwin: ['Library/Caches/pip'],
+      linux: ['.cache/pip'],
+    },
+  },
+  cargo: {
+    config: { default: ['.cargo/config.toml'] },
+    cache: { default: ['.cargo/registry'] },
+  },
+  rustup: {
+    config: { default: ['.cargo/config.toml'] },
+    cache: { default: ['.rustup'] },
+  },
+  docker: {
+    config: { default: ['.docker/config.json'] },
+  },
+  ssh: {
+    config: { default: ['.ssh'] },
+  },
+  starship: {
+    config: { default: ['.config/starship.toml'] },
+  },
+};
+
 function resolveLocations(id, platform, { home, env, fs: fsMod, manager, binPath }) {
   const join = (...parts) => path.join(...parts);
   const appData = env.APPDATA || join(home, 'AppData', 'Roaming');
@@ -111,7 +164,18 @@ function resolveLocations(id, platform, { home, env, fs: fsMod, manager, binPath
       docs.push(join(path.dirname(path.dirname(binPath)), 'lib', 'node_modules', id));
     }
   }
-  return { config, cache, docs };
+  // well-known REAL locations first (git → ~/.gitconfig, npm → ~/.npm …)
+  const wk = WELL_KNOWN[id];
+  const wellKnown = section => {
+    if (!wk || !wk[section]) return [];
+    const map = wk[section];
+    return (map[platform] || map.default || []).map(rel => join(home, ...rel.split('/')));
+  };
+  return {
+    config: [...wellKnown('config'), ...config],
+    cache: [...wellKnown('cache'), ...cache],
+    docs,
+  };
 }
 
 // Platform reveal availability (Phase 5 composes the actual command):
@@ -134,6 +198,10 @@ function revealAvailable(platform, { env, fs: fsMod }) {
   }
 }
 
+// Manager availability lives in inventory (managerAvailable) — the scan uses
+// the same map for registry healing (owner fix: a recorded method whose
+// manager is absent must not claim attribution NOR enable actions).
+
 function getToolInfo(entry, opts = {}) {
   const platform = opts.platform || process.platform;
   const home = opts.home || os.homedir();
@@ -148,9 +216,12 @@ function getToolInfo(entry, opts = {}) {
   const docsPaths = existingAmong(locations.docs, { fs: fsMod });
 
   const size = entry.binPath ? computeSize(entry.binPath, { fs: fsMod }) : null;
+  const available = managerAvailable(entry.manager, {
+    env, platform, statSync: fsMod.statSync, accessSync: fsMod.accessSync,
+  });
   const flags = {
-    canUpdate: Boolean(entry.manager),
-    canRemove: Boolean(entry.manager),
+    canUpdate: Boolean(entry.manager) && available,
+    canRemove: Boolean(entry.manager) && (entry.manager === 'go' || available),
     hasCache: cachePaths.length > 0,
     canReveal: Boolean(entry.binPath) && revealAvailable(platform, { env, fs: fsMod }),
   };

@@ -15,17 +15,39 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { scanInventory } = require('../../../src/tools/inventory');
+const { scanInventory, findOnPath } = require('../../../src/tools/inventory');
 
 // #37 Phase 2 probing runs real manager commands by default — tests that only
 // exercise merge/progress behavior stub exec so nothing spawns on the host.
 const noExec = (cmd, opts, cb) => cb(new Error('spawn ENOENT'), '');
 const goBin = () => path.join(os.tmpdir(), 'adm-no-such-go-bin');
 
+describe('findOnPath (owner fix: Windows app-execution aliases)', () => {
+  test('a stat EACCES alias (winget.exe reparse point) still resolves — ACCESS is the authority', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'adm-alias-'));
+    const alias = path.join(dir, 'winget.exe');
+    fs.writeFileSync(alias, '');
+    const eacces = () => { const e = new Error('EACCES'); e.code = 'EACCES'; throw e; };
+    const aliasFs = {
+      accessSync: p => { if (!String(p).endsWith('winget.exe')) throw new Error('ENOENT'); },
+      statSync: p => { if (String(p).endsWith('winget.exe')) eacces(); return { isFile: () => true }; },
+    };
+    expect(findOnPath('winget', { env: { PATH: dir }, platform: 'win32', statSync: aliasFs.statSync, accessSync: aliasFs.accessSync })).toBe(alias);
+  });
+
+  test('a DIRECTORY sharing the tool name is rejected (stat works, isFile false)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'adm-alias2-'));
+    fs.mkdirSync(path.join(dir, 'git'));
+    const allDirsFs = { accessSync: () => {}, statSync: () => ({ isFile: () => false }) };
+    expect(findOnPath('git', { env: { PATH: dir }, platform: 'linux', statSync: allDirsFs.statSync, accessSync: allDirsFs.accessSync })).toBeNull();
+  });
+});
+
 describe('scanInventory', () => {
   test('merges registry + npm + PATH hit for the same tool into ONE entry attributed to the registry', async () => {
     const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'adm-path-'));
     fs.writeFileSync(path.join(binDir, 'typescript'), '#!/bin/sh\n');
+    fs.writeFileSync(path.join(binDir, 'npm'), '#!/bin/sh\n'); // registry method must be reachable
 
     const res = await scanInventory({
       registry: [{ id: 'typescript', name: 'TypeScript', method: 'npm', installedAt: '2026-01-01T00:00:00.000Z' }],
@@ -107,7 +129,7 @@ describe('scanInventory', () => {
     expect(res.groups.find(g => g.id === 'other').entries.map(e => e.id)).toEqual(['fzf']);
   });
 
-  test('failing npm exec → empty npm group + warning, never a crash', async () => {
+  test('failing npm exec → empty npm group, silent (missing manager is normal), never a crash', async () => {
     const res = await scanInventory({
       registry: [],
       catalog: [],
@@ -116,7 +138,7 @@ describe('scanInventory', () => {
 
     const npmGroup = res.groups.find(g => g.id === 'npm');
     expect(npmGroup.entries).toHaveLength(0);
-    expect(npmGroup.warning).toBeTruthy();
+    expect(npmGroup.warning).toBeNull(); // owner fix: missing manager is not noise
   });
 
   test('successful npm exec (production wiring) feeds the npm group', async () => {
@@ -257,6 +279,7 @@ describe('scanInventory', () => {
     const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'adm-collide-'));
     const ids = ['alpha', 'bravo', 'charlie', 'delta', 'echo'];
     for (const id of ids) fs.writeFileSync(path.join(binDir, id), '#!/bin/sh\n');
+    fs.writeFileSync(path.join(binDir, 'npm'), '#!/bin/sh\n'); // registry method must be reachable
 
     const res = await scanInventory({
       registry: ids.map(id => ({ id, name: `${id}-display`, method: 'npm', installedAt: '2026-02-02T00:00:00.000Z' })),
@@ -302,9 +325,93 @@ describe('scanInventory', () => {
     expect(res.groups.find(g => g.id === 'system').entries).toHaveLength(0);
   });
 
+  // ---- registry healing (owner fix: 'brew' recorded on machines without brew) ----
+
+  test('a registry method whose manager is ABSENT loses attribution (never lies about brew)', async () => {
+    const res = await scanInventory({
+      registry: [
+        { id: 'git', name: 'Git', method: 'brew', installedAt: '2026-01-01T00:00:00.000Z' },
+        { id: 'gh', name: 'GitHub CLI', method: 'brew', installedAt: '2026-01-01T00:00:00.000Z' },
+      ],
+      npmJson: JSON.stringify({ dependencies: {} }),
+      catalog: [],
+      env: { PATH: '' }, // nothing reachable — brew cannot claim these
+      execFunc: noExec,
+      goBinDir: goBin(),
+    });
+
+    for (const id of ['git', 'gh']) {
+      const e = res.entries.find(x => x.id === id);
+      expect(e).toMatchObject({ source: 'adm', manager: null, installedAt: '2026-01-01T00:00:00.000Z' });
+    }
+  });
+
+  test('a registry method whose manager IS reachable keeps attribution', async () => {
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'adm-heal-'));
+    fs.writeFileSync(path.join(binDir, 'npm'), '#!/bin/sh\n');
+    const res = await scanInventory({
+      registry: [{ id: 'typescript', name: 'TypeScript', method: 'npm', installedAt: null }],
+      npmJson: JSON.stringify({ dependencies: {} }),
+      catalog: [],
+      env: { PATH: binDir },
+      execFunc: noExec,
+      goBinDir: goBin(),
+    });
+    expect(res.entries.find(e => e.id === 'typescript')).toMatchObject({ source: 'adm', manager: 'npm' });
+  });
+
+  test('a broken registry method falls back to the DETECTED system manager (winget on Windows)', async () => {
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'adm-heal2-'));
+    fs.writeFileSync(path.join(binDir, 'winget'), '#!/bin/sh\n'); // winget reachable, brew not
+    const res = await scanInventory({
+      platform: 'win32',
+      registry: [{ id: 'git', name: 'Git', method: 'brew', installedAt: '2026-01-01T00:00:00.000Z' }],
+      catalog: [],
+      env: { PATH: binDir },
+      execFunc: noExec, // all probes fail → missing → silent; healing is PATH-based
+      goBinDir: goBin(),
+    });
+    // u/r stay ACTIVE: the tool is attributed to the manager that really
+    // owns it on this machine (the wizard installed it via winget)
+    expect(res.entries.find(e => e.id === 'git')).toMatchObject({ source: 'adm', manager: 'winget' });
+  });
+
+  test('the manager probe fills ADM entries through PACKAGE ids (git → Git.Git) — no duplicate rows', async () => {
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'adm-heal3-'));
+    fs.writeFileSync(path.join(binDir, 'winget'), '#!/bin/sh\n');
+    const res = await scanInventory({
+      platform: 'win32',
+      registry: [
+        { id: 'git', name: 'Git', method: 'brew', installedAt: null },
+        { id: 'gh', name: 'GitHub CLI', method: 'brew', installedAt: null },
+      ],
+      wingetOut: [
+        'Nazwa            Id            Wersja',
+        '------------------------------',
+        'Git              Git.Git       2.43.0',
+        'GitHub CLI       GitHub.cli    2.63.0',
+      ].join('\n'),
+      catalog: [],
+      env: { PATH: binDir },
+      execFunc: noExec,
+      goBinDir: goBin(),
+    });
+
+    // ONE entry per tool — the winget PACKAGE row merged into the registry id
+    const git = res.entries.filter(e => e.id === 'git' || e.id === 'Git.Git');
+    expect(git).toHaveLength(1);
+    expect(git[0]).toMatchObject({ source: 'adm', manager: 'winget', version: '2.43.0' });
+    const gh = res.entries.filter(e => e.id === 'gh' || e.id === 'GitHub.cli');
+    expect(gh).toHaveLength(1);
+    expect(gh[0]).toMatchObject({ source: 'adm', manager: 'winget', version: '2.63.0' });
+    expect(res.groups.find(g => g.id === 'adm').entries.map(e => e.id)).toEqual(['gh', 'git']);
+    expect(res.groups.find(g => g.id === 'system').entries).toHaveLength(0);
+  });
+
   // ---- #37: resilience — broken input / missing manager per group ×8 ----
-  // For EVERY group: its source failing (corrupt output, missing manager)
-  // leaves the group EMPTY + warned and the scan RESOLVES — never crashes.
+  // For EVERY group: its source failing leaves the group EMPTY and the scan
+  // RESOLVES — never crashes. Owner policy: a MISSING manager stays SILENT
+  // (empty groups without warnings are hidden), only BROKEN output warns.
 
   const failingExec = (cmd, opts, cb) => cb(new Error('spawn ENOENT'), '');
 
@@ -322,44 +429,38 @@ describe('scanInventory', () => {
     expect(res.groups.find(g => g.id === 'adm').warning).toBeTruthy();
   });
 
-  test('×8 [npm]: npm missing → empty group + warning', async () => {
+  test('×8 [npm]: npm missing → empty group, silent', async () => {
     const res = await scanInventory({ registry: [], catalog: [], execFunc: failingExec, goBinDir: goBin() });
-    expect(res.groups.find(g => g.id === 'npm')).toMatchObject({ entries: [] });
-    expect(res.groups.find(g => g.id === 'npm').warning).toBeTruthy();
+    expect(res.groups.find(g => g.id === 'npm')).toMatchObject({ entries: [], warning: null });
   });
 
-  test('×8 [brew]: brew missing → empty group + warning (on a brew platform)', async () => {
+  test('×8 [brew]: brew missing → empty group, silent (on a brew platform)', async () => {
     const res = await scanInventory({
       registry: [], catalog: [], platform: 'darwin', execFunc: failingExec, goBinDir: goBin(),
     });
-    expect(res.groups.find(g => g.id === 'brew')).toMatchObject({ entries: [] });
-    expect(res.groups.find(g => g.id === 'brew').warning).toBeTruthy();
+    expect(res.groups.find(g => g.id === 'brew')).toMatchObject({ entries: [], warning: null });
   });
 
-  test('×8 [pip]: pip3 missing → empty group + warning', async () => {
+  test('×8 [pip]: pip3 missing → empty group, silent', async () => {
     const res = await scanInventory({ registry: [], catalog: [], execFunc: failingExec, goBinDir: goBin() });
-    expect(res.groups.find(g => g.id === 'pip')).toMatchObject({ entries: [] });
-    expect(res.groups.find(g => g.id === 'pip').warning).toBeTruthy();
+    expect(res.groups.find(g => g.id === 'pip')).toMatchObject({ entries: [], warning: null });
   });
 
-  test('×8 [cargo]: cargo missing → empty group + warning', async () => {
+  test('×8 [cargo]: cargo missing → empty group, silent', async () => {
     const res = await scanInventory({ registry: [], catalog: [], execFunc: failingExec, goBinDir: goBin() });
-    expect(res.groups.find(g => g.id === 'cargo')).toMatchObject({ entries: [] });
-    expect(res.groups.find(g => g.id === 'cargo').warning).toBeTruthy();
+    expect(res.groups.find(g => g.id === 'cargo')).toMatchObject({ entries: [], warning: null });
   });
 
-  test('×8 [go]: ~/go/bin missing → empty group + warning', async () => {
+  test('×8 [go]: ~/go/bin missing → empty group, silent', async () => {
     const res = await scanInventory({ registry: [], catalog: [], execFunc: failingExec, goBinDir: goBin() });
-    expect(res.groups.find(g => g.id === 'go')).toMatchObject({ entries: [] });
-    expect(res.groups.find(g => g.id === 'go').warning).toBeTruthy();
+    expect(res.groups.find(g => g.id === 'go')).toMatchObject({ entries: [], warning: null });
   });
 
-  test('×8 [system]: all Windows managers missing → empty group + warning', async () => {
+  test('×8 [system]: all Windows managers missing → empty group, silent', async () => {
     const res = await scanInventory({
       registry: [], catalog: [], platform: 'win32', execFunc: failingExec, goBinDir: goBin(),
     });
-    expect(res.groups.find(g => g.id === 'system')).toMatchObject({ entries: [] });
-    expect(res.groups.find(g => g.id === 'system').warning).toBeTruthy();
+    expect(res.groups.find(g => g.id === 'system')).toMatchObject({ entries: [], warning: null });
   });
 
   test('×8 [system]: broken dpkg output + missing siblings → empty group + warning, no crash', async () => {
