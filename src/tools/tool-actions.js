@@ -289,7 +289,20 @@ function buildRevealCommand(platform, targetPath, { fs: fsMod = fs } = {}) {
   let p = String(targetPath);
   if (platform === 'darwin') return `open -R "${nearestExisting(p, fsMod)}"`;
   if (platform === 'win32') {
-    p = nearestExisting(p.replace(/\//g, '\\'), fsMod);
+    // Normalize POSIX separators ONLY when the swapped variant actually
+    // exists (registry entries can carry forward slashes) — on a POSIX host
+    // the target IS a POSIX path; blind swapping would corrupt it.
+    let target = p;
+    if (p.includes('/')) {
+      try {
+        const swapped = p.replace(/\//g, '\\');
+        fsMod.statSync(swapped);
+        target = swapped;
+      } catch {
+        target = p;
+      }
+    }
+    p = nearestExisting(target, fsMod);
     return `explorer /select,"${p}"`;
   }
   if (platform === 'linux') {

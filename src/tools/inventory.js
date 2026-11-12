@@ -135,11 +135,15 @@ const MANAGER_SOURCES = [
 // Pure PATH walk (same contract as pkg/managers.isManagerAvailable):
 // returns the first existing executable candidate or null.
 function findOnPath(binName, { env, platform, statSync, accessSync }) {
-  const sep = platform === 'win32' ? ';' : ':';
-  // Path separator follows the INJECTED platform (tests may fake 'linux' on
-  // a Windows host — path.sep alone would build '\Users\…' candidates).
-  const psep = platform === 'win32' ? path.sep : '/';
-  const dirs = String(env.PATH || env.Path || '').split(sep).filter(Boolean);
+  // The PATH VALUE decides its own grammar — not the (possibly injected)
+  // platform: tests may fake platform 'linux' on a Windows host while the
+  // env keeps a Windows PATH ('C:\…;D:\…'). Splitting that on ':' would cut
+  // drive letters off and every lookup would miss (windows-latest CI).
+  const rawPath = String(env.PATH || env.Path || '');
+  const windowsStyle = rawPath.includes(';') || /^[A-Za-z]:/.test(rawPath);
+  const sep = windowsStyle ? ';' : ':';
+  const psep = windowsStyle ? '\\' : (platform === 'win32' ? path.sep : '/');
+  const dirs = rawPath.split(sep).filter(Boolean);
   const exts = platform === 'win32' ? ['', '.exe', '.cmd', '.bat', '.ps1'] : [''];
   for (const dir of dirs) {
     for (const ext of exts) {

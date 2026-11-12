@@ -1205,9 +1205,12 @@ describe('tools TUI actions (Phase 4 + 5)', () => {
     fs.writeFileSync(bin, 'x');
     const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'adm-tui-revc-'));
     const platform = process.platform;
-    const expectCmd = target => (platform === 'win32'
-      ? `explorer /select,"${target}"`
-      : platform === 'darwin' ? `open -R "${target}"` : `xdg-open "${path.dirname(target)}"`);
+    const expectCmd = target => {
+      if (platform === 'win32') return `explorer /select,"${target}"`;
+      if (platform === 'darwin') return `open -R "${target}"`;
+      // linux xdg-open opens FOLDERS: a FILE target resolves to its parent
+      return `xdg-open "${fs.statSync(target).isFile() ? path.dirname(target) : target}"`;
+    };
     const revInfo = e => ({ ...actionInfo(e), binPath: bin, cachePaths: [cacheDir] });
     const t = mountActions({ platform, doneDelayMs: 30000, toolInfo: revInfo });
     await selectTool(t);
