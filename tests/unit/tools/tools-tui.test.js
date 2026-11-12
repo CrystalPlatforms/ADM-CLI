@@ -37,7 +37,7 @@ const os = require('os');
 const path = require('path');
 const { Writable } = require('stream');
 const { EventEmitter } = require('events');
-const { createToolsApp, runToolsTui, buildView } = require('../../../src/tools/tools-tui');
+const { createToolsApp, runToolsTui, buildView, buildPanel } = require('../../../src/tools/tools-tui');
 const { scanInventory } = require('../../../src/tools/inventory');
 const { FRAMES } = require('../../../src/setup/loader');
 
@@ -49,7 +49,7 @@ function screenText(stdout) {
   const chunks = stdout.writes;
   return strip(chunks[chunks.length - 1] || '');
 }
-const linesOf = frame => frame.split('\n').map(l => l.replace(/^>\s/, '').trim()).filter(Boolean);
+const linesOf = frame => frame.split('\n').map(l => l.split('│')[0].replace(/^>\s/, '').trim()).filter(Boolean);
 
 // real inventory module behind the injected scan fn — the TUI contract is
 // "whatever scanInventory returns", so tests go through the public interface.
@@ -115,7 +115,8 @@ describe('tools TUI (skin)', () => {
     return { stdout, inDev, exited: () => exited };
   };
 
-  const rawLines = stdout => screenText(stdout).split('\n').filter(l => l.trim());
+  // #38: frames are TWO columns (list │ panel) — helpers look at the LIST side
+  const rawLines = stdout => screenText(stdout).split('\n').map(l => l.split('│')[0].replace(/\s+$/, '')).filter(l => l.trim());
 
   test('scan screen animates dots_12 frames with a Scanning counter, then the list replaces it', async () => {
     let fireProgress, fireDone;
@@ -443,7 +444,8 @@ describe('tools TUI (skin)', () => {
       const f2 = t.stdout.writes[t.stdout.writes.length - 1];
       const admLine = f2.split('\n').find(l => strip(l).includes('ADM (1) ▾'));
       expect(admLine).toContain(GREEN);
-      expect(admLine).not.toContain('\x1b[1m');
+      // assert the LIST column only — the panel column carries its own styling
+      expect(admLine.split('│')[0]).not.toContain('\x1b[1m');
     } finally {
       chalk.level = prev;
     }
@@ -592,5 +594,289 @@ describe('tools TUI (skin)', () => {
     expect(collapsed.rows[0]).toContain('npm (1) ▸'); // count stays, arrow flips
     expect(collapsed.rows.join('\n')).not.toContain('eslint');
     expect(collapsed.selectable.map(s => s.id)).toEqual(['npm', 'other', 'fzf']);
+  });
+
+  // ---- #38 Phase 3: the side panel (lazy tool-info + capability flags) ----
+
+  // Tool-info fakes (the TUI receives the real getToolInfo in production).
+  const richInfo = entry => ({
+    id: entry.id, name: entry.name,
+    version: '5.4.5', binPath: `/usr/bin/${entry.id}`, method: 'npm',
+    size: 1572864, sizeLabel: '1.5 MB',
+    configPaths: [`~/.config/${entry.id}`], cachePaths: [`~/.cache/${entry.id}`], docsPaths: [],
+    flags: { canUpdate: true, canRemove: true, hasCache: true, canReveal: true },
+  });
+  const sparseInfo = entry => ({
+    id: entry.id, name: entry.name,
+    version: null, binPath: null, method: null,
+    size: null, sizeLabel: null,
+    configPaths: [], cachePaths: [], docsPaths: [],
+    flags: { canUpdate: false, canRemove: false, hasCache: false, canReveal: false },
+  });
+
+  test('panel fills LAZILY: zero tool-info calls during scan or on headers, one per tool selection', async () => {
+    const calls = [];
+    const t = mount({
+      toolInfo: e => { calls.push(e.id); return richInfo(e); },
+    });
+    await flush();
+    await flush();
+    // scan done, cursor sits on the ADM HEADER — nothing computed yet
+    expect(calls).toEqual([]);
+
+    t.inDev.press('\x1b[B'); // onto TypeScript
+    expect(calls).toEqual(['typescript']);
+
+    t.inDev.press('\x1b[B'); // npm header — placeholder again, no call
+    t.inDev.press('\x1b[B'); // eslint
+    expect(calls).toEqual(['typescript', 'eslint']);
+  });
+
+  test('headers keep the panel as a placeholder until a tool row is selected', async () => {
+    const t = mount({ toolInfo: richInfo });
+    await flush();
+    await flush();
+    expect(screenText(t.stdout)).toContain('select a tool');
+  });
+
+  test('panel shows the selected tool data: name, version, path, method, size, locations, legend', async () => {
+    // a wide terminal so long paths fit the panel column without clipping
+    const stdout = fakeStdout();
+    stdout.columns = 130;
+    const inDev = fakeStdin();
+    app = createToolsApp({ scan: scanFixtures, stdout, stdin: inDev.stdin, toolInfo: richInfo });
+    app.run();
+    await flush();
+    await flush();
+    inDev.press('\x1b[B'); // TypeScript
+    const frame = screenText(stdout);
+    expect(frame).toContain('TypeScript');
+    expect(frame).toContain('5.4.5');
+    // the panel is a narrow strip by owner design (~20 cols min) — long
+    // values CLIP with '…'; full values live in the tool-info bundle itself
+    expect(frame).toContain('/usr/bin/');
+    expect(frame).toContain('npm');
+    expect(frame).toContain('1.5 MB');
+    expect(frame).toContain('~/.config');
+    expect(frame).toContain('~/.cache');
+    expect(frame).toMatch(/docs\s+—/); // empty docs → gap marker
+    expect(frame).toContain('(u) update');
+    expect(frame).toContain('(f) folder');
+    expect(frame).toContain('(c) cache');
+  });
+
+  test('missing data renders "—" and the legend dims EXACTLY per flags', async () => {
+    const chalk = require('chalk');
+    const prev = chalk.level;
+    chalk.level = 2; // dim codes visible (setup forces 0)
+    try {
+      const t = mount({ toolInfo: sparseInfo });
+      await flush();
+      await flush();
+      t.inDev.press('\x1b[B'); // a tool with every gap
+      const lines = t.stdout.writes[t.stdout.writes.length - 1].split('\n');
+      const gap = lines.find(l => l.includes('version'));
+      expect(gap).toContain('—');
+      for (const key of ['(u) update', '(r) remove', '(f) folder', '(c) cache']) {
+        const line = lines.find(l => l.includes(key));
+        expect(line.split('│')[1]).toContain('\x1b[2m'); // panel side: dimmed
+      }
+    } finally {
+      chalk.level = prev;
+    }
+  });
+
+  test('an active legend line renders WITHOUT dim codes (flags true)', async () => {
+    const chalk = require('chalk');
+    const prev = chalk.level;
+    chalk.level = 2;
+    try {
+      const t = mount({ toolInfo: richInfo });
+      await flush();
+      await flush();
+      t.inDev.press('\x1b[B');
+      const lines = t.stdout.writes[t.stdout.writes.length - 1].split('\n');
+      const line = lines.find(l => l.includes('(u) update'));
+      expect(line.split('│')[1]).not.toContain('\x1b[2m'); // panel side: active — not dimmed
+    } finally {
+      chalk.level = prev;
+    }
+  });
+
+  test('↑↓ moves the panel to the selected tool WITHOUT rescanning or reloading the list', async () => {
+    let scans = 0;
+    const scan = onProgress => { scans += 1; return scanFixtures(onProgress); };
+    const t = mount({ scan, toolInfo: e => ({ ...richInfo(e), name: `PANEL-${e.id}` }) });
+    await flush();
+    await flush();
+    expect(scans).toBe(1);
+
+    t.inDev.press('\x1b[B'); // TypeScript
+    let frame = screenText(t.stdout);
+    expect(frame).toContain('PANEL-typescript');
+    expect(frame).toContain('> TypeScript'); // list row still there
+
+    t.inDev.press('\x1b[B'); // npm header
+    t.inDev.press('\x1b[B'); // eslint
+    frame = screenText(t.stdout);
+    expect(frame).toContain('PANEL-eslint');   // panel followed the selection…
+    expect(frame).toContain('TypeScript');     // …while the list rows stayed
+    expect(scans).toBe(1);                     // no rescan, no list reload
+  });
+
+  test('the panel column starts at ~85% of the terminal (owner fix, round 4)', async () => {
+    // owner keeps pushing the separator right: 40% → 55% → 70% → 75% → ~85%.
+    // The panel keeps a hard minimum (~20 cols) so the buttons still fit.
+    const stdout = fakeStdout();
+    stdout.columns = 100;
+    const inDev = fakeStdin();
+    app = createToolsApp({ scan: scanFixtures, stdout, stdin: inDev.stdin, toolInfo: richInfo });
+    app.run();
+    await flush();
+    await flush();
+    inDev.press('\x1b[B'); // a tool row → panel filled
+    const firstLine = screenText(stdout).split('\n')[0];
+    const sepIdx = firstLine.indexOf('│');
+    expect(sepIdx).toBeGreaterThanOrEqual(79);
+    expect(sepIdx).toBeLessThanOrEqual(84);
+    // buttons never clip out of the panel column
+    const buttonLine = screenText(stdout).split('\n').find(l => l.includes('(u) update'));
+    expect(strip(buttonLine).indexOf('(u) update')).toBeGreaterThan(sepIdx);
+  });
+
+  test('⚠ warning rows KEEP the panel separator (owner fix: the │ went missing there)', async () => {
+    const scan = onProgress => {
+      const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'adm-tui-sep-'));
+      return scanInventory({
+        configDir: fs.mkdtempSync(path.join(os.tmpdir(), 'adm-tui-sep-empty-')), // ⚠ ADM registry
+        npmJson: 'not json at all', // ⚠ npm group
+        catalog: [],
+        env: { PATH: binDir },
+        execFunc: (cmd, _o, cb) => cb(null, ''),
+        goBinDir: fs.mkdtempSync(path.join(os.tmpdir(), 'adm-tui-sep-gobin-')),
+        onProgress,
+      });
+    };
+    const t = mount({ scan, toolInfo: sparseInfo });
+    await flush();
+    await flush();
+    const frame = t.stdout.writes[t.stdout.writes.length - 1];
+    const warnLine = frame.split('\n').find(l => l.includes('⚠'));
+    expect(warnLine).toBeTruthy();
+    expect(warnLine).toContain('│'); // the separator survives on ⚠ lines
+  });
+
+  test('legend renders as BUTTONS "(u) update" (owner UX, round 1)', async () => {
+    const t = mount({ toolInfo: richInfo });
+    await flush();
+    await flush();
+    t.inDev.press('\x1b[B'); // a tool → panel with buttons
+    const frame = screenText(t.stdout);
+    expect(frame).toContain('(u) update');
+    expect(frame).toContain('(r) remove');
+    expect(frame).toContain('(f) folder');
+    expect(frame).toContain('(c) cache');
+  });
+
+  test('→ moves the hover onto the update button; ↑↓ cycle r/f/c; ← returns to the list', async () => {
+    const chalk = require('chalk');
+    const prev = chalk.level;
+    chalk.level = 2;
+    try {
+      const t = mount({ toolInfo: richInfo });
+      await flush();
+      await flush();
+      t.inDev.press('\x1b[B'); // tool hovered in the list
+      expect(strip(screenText(t.stdout))).toContain('> TypeScript');
+
+      t.inDev.press('\x1b[C'); // → hover jumps to the (u) update button
+      let lines = t.stdout.writes[t.stdout.writes.length - 1].split('\n');
+      const ub = lines.find(l => l.includes('(u) update'));
+      expect(strip(ub)).toContain('> (u) update');       // pointer on the button
+      expect(ub.split('│')[1]).toContain('\x1b[1m');         // focused = bold
+      // the list keeps its marker but loses the bold hover style
+      const tsLine = lines.find(l => strip(l).includes('> TypeScript'));
+      expect(tsLine.split('│')[0]).not.toContain('\x1b[1m');
+
+      t.inDev.press('\x1b[B'); // ↓ → (r) remove
+      lines = t.stdout.writes[t.stdout.writes.length - 1].split('\n');
+      expect(strip(lines.find(l => l.includes('(r) remove')))).toContain('> (r) remove');
+
+      t.inDev.press('\x1b[B'); // ↓ → (f) folder
+      lines = t.stdout.writes[t.stdout.writes.length - 1].split('\n');
+      expect(strip(lines.find(l => l.includes('(f) folder')))).toContain('> (f) folder');
+
+      t.inDev.press('\x1b[A'); // ↑ back to (r)
+      lines = t.stdout.writes[t.stdout.writes.length - 1].split('\n');
+      expect(strip(lines.find(l => l.includes('(r) remove')))).toContain('> (r) remove');
+
+      t.inDev.press('\x1b[D'); // ← returns the hover to the list
+      const backLine = t.stdout.writes[t.stdout.writes.length - 1].split('\n').find(l => strip(l).includes('> TypeScript'));
+      expect(backLine.split('│')[0]).toContain('\x1b[1m'); // list hovered (bold) again
+      lines = t.stdout.writes[t.stdout.writes.length - 1].split('\n');
+      expect(strip(lines.find(l => l.includes('(u) update')))).not.toContain('> (');
+    } finally {
+      chalk.level = prev;
+    }
+  });
+
+  test('the hover SKIPS dimmed buttons; with every button dimmed → stays on the list (owner fix)', async () => {
+    const chalk = require('chalk');
+    const prev = chalk.level;
+    chalk.level = 2;
+    try {
+      // u + r enabled, f + c dimmed
+      const partialInfo = entry => ({
+        ...richInfo(entry),
+        flags: { canUpdate: true, canRemove: true, canReveal: false, hasCache: false },
+      });
+      const t = mount({ toolInfo: partialInfo });
+      await flush();
+      await flush();
+      t.inDev.press('\x1b[B'); // tool hovered
+      t.inDev.press('\x1b[C'); // → lands on the FIRST ENABLED button (u)
+      let lines = t.stdout.writes[t.stdout.writes.length - 1].split('\n');
+      expect(strip(lines.find(l => l.includes('(u) update')))).toContain('> (u) update');
+
+      t.inDev.press('\x1b[B'); // ↓ → r (enabled)
+      lines = t.stdout.writes[t.stdout.writes.length - 1].split('\n');
+      expect(strip(lines.find(l => l.includes('(r) remove')))).toContain('> (r) remove');
+
+      t.inDev.press('\x1b[B'); // ↓ skips dimmed f and c, wraps back to u
+      lines = t.stdout.writes[t.stdout.writes.length - 1].split('\n');
+      expect(strip(lines.find(l => l.includes('(u) update')))).toContain('> (u) update');
+
+      t.inDev.press('\x1b[A'); // ↑ skips f and c backwards → r
+      lines = t.stdout.writes[t.stdout.writes.length - 1].split('\n');
+      expect(strip(lines.find(l => l.includes('(r) remove')))).toContain('> (r) remove');
+
+      // EVERY button dimmed → → never leaves the list
+      const t2 = mount({ toolInfo: sparseInfo });
+      await flush();
+      await flush();
+      t2.inDev.press('\x1b[B'); // tool hovered
+      t2.inDev.press('\x1b[C'); // → nothing to focus — list keeps the hover
+      const l2 = t2.stdout.writes[t2.stdout.writes.length - 1].split('\n');
+      const ts2 = l2.find(l => strip(l).includes('> TypeScript'));
+      expect(ts2.split('│')[0]).toContain('\x1b[1m'); // list still bold (hovered)
+      const ub2 = l2.find(l => l.includes('(u) update'));
+      expect(strip(ub2)).not.toContain('> (');        // no pointer on buttons
+    } finally {
+      chalk.level = prev;
+    }
+  });
+
+  test('buildPanel (model): gaps become "—", legend lines map 1:1 to flags', () => {
+    const rich = buildPanel(richInfo({ id: 'x', name: 'X' }), { width: 40 });
+    const richJoined = rich.join('\n');
+    expect(richJoined).toContain('X');
+    expect(richJoined).toContain('5.4.5');
+    // rich bundle has exactly ONE gap — docs (fixture provides no docs paths)
+    expect(richJoined.split('—').length - 1).toBe(1);
+
+    const sparse = buildPanel(sparseInfo({ id: 'y', name: 'y' }), { width: 40 });
+    const sparseJoined = sparse.join('\n');
+    const gapCount = sparseJoined.split('—').length - 1;
+    expect(gapCount).toBe(7); // version, path, method, size, config, cache, docs
   });
 });

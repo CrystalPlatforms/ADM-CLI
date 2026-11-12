@@ -17,10 +17,72 @@
 const chalk = require('chalk');
 const { FRAMES } = require('../setup/loader');
 const { scanInventory } = require('./inventory');
+const { getToolInfo } = require('./tool-info');
 
 const FRAME_INTERVAL = 80; // same cadence as setup/loader.js
 
-const HINT = '↑↓ move · Enter/Space expand/collapse · F5/Shift+R rescan · q quit';
+const HINT = '↑↓ move · →/← actions · Enter/Space collapse · F5/Shift+R rescan · q quit';
+
+// strips ANSI so visible widths can be computed (padding/truncation)
+const stripAnsi = s => String(s).replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
+
+// clips a cell to the visible width (ANSI stripped — a truncated row loses
+// its color, acceptable for overlong warnings/paths)
+const clip = (s, width) => `${stripAnsi(s).slice(0, Math.max(0, width - 1))}…`;
+
+// One frame row cell: clipped to the column width, then padded so the right
+// column starts at the same offset on every line.
+const padCell = (s, width) => {
+  const visible = stripAnsi(s);
+  return visible.length > width ? clip(s, width) : s + ' '.repeat(width - visible.length);
+};
+
+const truncateCell = (s, width) => (stripAnsi(s).length > width ? clip(s, width) : s);
+
+// The action buttons (owner UX: "(u) update" chips, no brackets — hover
+// renders red+bold with the '>' pointer). Order is the ↑↓ cycle order in the
+// buttons focus. Flags dim a button; executing is Phase 4/5.
+const BUTTONS = [
+  { key: 'u', label: 'update', flag: 'canUpdate' },
+  { key: 'r', label: 'remove', flag: 'canRemove' },
+  { key: 'f', label: 'folder', flag: 'canReveal' },
+  { key: 'c', label: 'cache', flag: 'hasCache' },
+];
+
+// The side panel (owner style: Claude-diff preview — dim keys, gap "—").
+// Pure model: (info | null, { width, focusButton }) => lines. A NULL info
+// renders the placeholder (selection sits on a group header, nothing
+// measured yet). focusButton: -1 = none (hover in the list), 0..3 = the
+// hovered button (red+bold+'>', same style as the list selection).
+function buildPanel(info, { width = 30, focusButton = -1 } = {}) {
+  if (!info) return [chalk.dim('select a tool — ↑↓')];
+  const lines = [];
+  lines.push(chalk.hex('#167c51').bold(truncateCell(info.name, width)));
+  lines.push(chalk.dim('─'.repeat(Math.min(26, Math.max(8, width)))));
+  const rows = [
+    ['version', info.version],
+    ['path', info.binPath],
+    ['method', info.method],
+    ['size', info.sizeLabel],
+    ['config', (info.configPaths && info.configPaths[0]) || null],
+    ['cache', (info.cachePaths && info.cachePaths[0]) || null],
+    ['docs', (info.docsPaths && info.docsPaths[0]) || null],
+  ];
+  for (const [label, value] of rows) {
+    const shown = value === null || value === undefined || value === '' ? chalk.dim('—') : truncateCell(String(value), width - 9);
+    lines.push(`${chalk.dim(label.padEnd(8))}${shown}`);
+  }
+  lines.push('');
+  BUTTONS.forEach((b, i) => {
+    const text = `(${b.key}) ${b.label}`;
+    const focused = i === focusButton;
+    const enabled = Boolean(info.flags && info.flags[b.flag]);
+    if (focused) lines.push(chalk.red.bold(`> ${text}`));
+    else if (enabled) lines.push(`  ${text}`);
+    else lines.push(chalk.dim(`  ${text}`));
+  });
+  return lines;
+}
 
 // Builds the visible rows AND the flat list of selectable positions.
 // Headers are selectable (Enter/Space target); a collapsed group hides its
@@ -32,18 +94,19 @@ const HINT = '↑↓ move · Enter/Space expand/collapse · F5/Shift+R rescan ·
 // coordinates (selected/top) count selectable rows, but the window slices
 // FRAME rows; warning rows occupy a frame row without being selectable, so
 // the two coordinate systems differ by exactly the warnings above a row.
-function buildView(result, selected, collapsed) {
+function buildView(result, selected, collapsed, focusInList = true) {
   const rows = [];
   const selectable = [];
   let idx = 0;
   for (const g of result.groups) {
     if (g.entries.length === 0 && !g.warning) continue;
     const isCollapsed = collapsed.has(g.id);
-    const sel = idx === selected;
+    const sel = idx === selected && focusInList;
+    const marked = idx === selected;
     const header = `${g.label} (${g.entries.length}) ${isCollapsed ? '▸' : '▾'}`;
     // owner decision (#37 follow-up): headers are ALWAYS green #167c51 and
     // gain bold on "hover" (the selection cursor — this TUI is keyboard-only)
-    rows.push(sel ? chalk.hex('#167c51').bold(`> ${header}`) : chalk.hex('#167c51')(`  ${header}`));
+    rows.push(sel ? chalk.hex('#167c51').bold(`> ${header}`) : chalk.hex('#167c51')(marked ? `> ${header}` : `  ${header}`));
     selectable.push({ type: 'header', id: g.id, rowIndex: rows.length - 1 });
     idx += 1;
     if (g.warning) {
@@ -51,8 +114,9 @@ function buildView(result, selected, collapsed) {
     }
     if (!isCollapsed) {
       for (const entry of g.entries) {
-        const s = idx === selected;
-        rows.push(s ? chalk.red.bold(`> ${entry.name}`) : `  ${entry.name}`);
+        const s = idx === selected && focusInList;
+        const m = idx === selected;
+        rows.push(s ? chalk.red.bold(`> ${entry.name}`) : (m ? `> ${entry.name}` : `  ${entry.name}`));
         selectable.push({ type: 'tool', id: entry.id, rowIndex: rows.length - 1 });
         idx += 1;
       }
@@ -69,6 +133,8 @@ function parseKey(chunk) {
   return {
     up: input === '\u001B[A',
     down: input === '\u001B[B',
+    right: input === '\u001B[C',
+    left: input === '\u001B[D',
     enter: input === '\r',
     space: input === ' ',
     q: input === 'q',
@@ -84,10 +150,14 @@ function parseKey(chunk) {
 //   stdin        EventEmitter emitting 'data' (keys)
 //   onExit       () => void — called on q / Ctrl+C
 //   viewportRows number — window height override (tests); default rows - 3
-function createToolsApp({ scan, stdout, stdin, onExit, viewportRows }) {
+function createToolsApp({ scan, stdout, stdin, onExit, viewportRows, toolInfo: toolInfoOpt }) {
+  const toolInfo = toolInfoOpt || getToolInfo;
   let progress = null;        // { done, total } | null
   let result = null;          // { entries, groups } | null
   let cursor = { selected: 0, top: 0 };
+  let panelInfo = null;       // tool-info bundle for the SELECTED tool | null
+  let focus = 'list';         // 'list' | 'buttons' — where the hover lives
+  let buttonIdx = 0;          // hovered button when focus === 'buttons'
   const collapsed = new Set();
   let frameTimer = null;
   let frame = 0;
@@ -143,7 +213,7 @@ function createToolsApp({ scan, stdout, stdin, onExit, viewportRows }) {
       return;
     }
     const { selected, top } = cursor;
-    const { rows, selectable } = buildView(result, selected, collapsed);
+    const { rows, selectable } = buildView(result, selected, collapsed, focus === 'list');
     // Window = FRAME rows from selectable[top] to selectable[top + height - 1]
     // (mapping through rowIndex — warning rows shift the two coordinate
     // systems, and slicing rows directly used to cut the selected row off).
@@ -156,7 +226,25 @@ function createToolsApp({ scan, stdout, stdin, onExit, viewportRows }) {
     const stop = lastIdx >= selectable.length - 1
       ? rows.length
       : selectable[lastIdx].rowIndex + 1;
-    paint(rows.slice(first, stop)); // the hint is pinned by paint() itself
+    const listLines = rows.slice(first, stop);
+
+    // TWO-COLUMN FRAME: list window left, side panel right. The panel is
+    // frame-height independent — it starts at the tool name regardless of
+    // where the list window sits.
+    const cols = stdout.columns || 80;
+    // owner fix (#38 feedback, round 3): the list keeps ~75% of the terminal.
+    // ⚠ warning rows render in the list column like every other row — at
+    // this width real warnings fit, and the separator stays unbroken.
+    const listWidth = Math.max(44, Math.min(cols - 22, Math.floor(cols * 0.85)));
+    const panelWidth = Math.max(10, cols - listWidth - 3);
+    const panelLines = buildPanel(panelInfo, { width: panelWidth, focusButton: focus === 'buttons' ? buttonIdx : -1 });
+    const height2 = Math.max(listLines.length, panelLines.length);
+    const composed = [];
+    for (let i = 0; i < height2; i += 1) {
+      const listLine = listLines[i] || '';
+      composed.push(`${padCell(listLine, listWidth)}${chalk.dim(' │ ')}${panelLines[i] || ''}`);
+    }
+    paint(composed); // the hint is pinned by paint() itself
   };
 
   const move = (delta) => {
@@ -186,9 +274,24 @@ function createToolsApp({ scan, stdout, stdin, onExit, viewportRows }) {
     }));
   };
 
+  // LAZY tool-info: recomputed ONLY when the selection changes to a tool row
+  // (never during the scan — the scan doesn't touch tool-info at all).
+  // Headers / placeholders → panelInfo null.
+  const refreshPanel = () => {
+    panelInfo = null;
+    if (!result) return;
+    const { selectable } = buildView(result, cursor.selected, collapsed);
+    const row = selectable[cursor.selected];
+    if (row && row.type === 'tool') {
+      const entry = result.entries.find(e => e.id === row.id);
+      if (entry) panelInfo = toolInfo(entry);
+    }
+  };
+
   // single state write → ONE paint per keypress (selection + window together)
   const setCursor = (updater) => {
     cursor = updater(cursor);
+    refreshPanel();
     render();
   };
 
@@ -211,7 +314,10 @@ function createToolsApp({ scan, stdout, stdin, onExit, viewportRows }) {
   const applyResult = (res) => {
     result = res;
     cursor = { selected: 0, top: 0 };
+    focus = 'list';
+    buttonIdx = 0;
     if (frameTimer) { clearInterval(frameTimer); frameTimer = null; }
+    refreshPanel(); // fresh scan → selection on a header → placeholder panel
     render();
   };
 
@@ -224,6 +330,8 @@ function createToolsApp({ scan, stdout, stdin, onExit, viewportRows }) {
     progress = null;
     frame = 0;
     cursor = { selected: 0, top: 0 };
+    focus = 'list';
+    buttonIdx = 0;
     startLoader();
     render();
     Promise.resolve()
@@ -239,10 +347,39 @@ function createToolsApp({ scan, stdout, stdin, onExit, viewportRows }) {
       if (onExit) onExit();
       return;
     }
-    if (key.up) move(-1);
-    else if (key.down) move(1);
-    else if (key.enter || key.space) toggle();
-    else if (key.f5 || key.shiftR) rescan();
+    // ENABLED buttons only — the hover never rests on a dimmed one; with all
+    // dimmed the → key simply does nothing (hover stays in the list)
+    const enabledButtons = () => (panelInfo && panelInfo.flags
+      ? BUTTONS.map((b, i) => (panelInfo.flags[b.flag] ? i : -1)).filter(i => i >= 0)
+      : []);
+
+    if (key.up || key.down) {
+      if (focus === 'buttons') {
+        const enabled = enabledButtons();
+        if (enabled.length > 0) {
+          const pos = enabled.indexOf(buttonIdx);
+          const next = ((pos + (key.down ? 1 : -1)) % enabled.length + enabled.length) % enabled.length;
+          buttonIdx = enabled[next];
+          render();
+        }
+      } else {
+        move(key.up ? -1 : 1);
+      }
+    } else if (key.right) {
+      // → moves the hover from a tool row onto the FIRST ENABLED action button
+      const enabled = enabledButtons();
+      if (panelInfo && enabled.length > 0) {
+        focus = 'buttons';
+        buttonIdx = enabled[0];
+        render();
+      }
+    } else if (key.left) {
+      if (focus === 'buttons') { focus = 'list'; render(); }
+    } else if (key.enter || key.space) {
+      if (focus === 'list') toggle(); // Enter on a button = Phase 4 action
+    } else if (key.f5 || key.shiftR) {
+      rescan();
+    }
     // lowercase r: intentionally unbound (remove in Phase 4)
   };
 
@@ -312,4 +449,4 @@ async function runToolsTui(opts = {}) {
   return 0;
 }
 
-module.exports = { createToolsApp, runToolsTui, buildView };
+module.exports = { createToolsApp, runToolsTui, buildView, buildPanel };

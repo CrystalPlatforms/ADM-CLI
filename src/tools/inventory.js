@@ -361,4 +361,4 @@ async function scanInventory(opts = {}) {
   return { entries: groups.flatMap(g => g.entries), groups };
 }
 
-module.exports = { scanInventory };
+module.exports = { scanInventory, findOnPath };
