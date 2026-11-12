@@ -8,6 +8,7 @@ const COMMANDS = [
   { name: 'feedback', summary: 'Show how to report bugs and ideas' },
   { name: 'config', summary: 'Show ADM config and detected environment', flags: ['--json'] },
   { name: 'uninstall', summary: 'Remove ADM data (~/.adm) and shell PATH entries' },
+  { name: 'tools', summary: 'Browse installed tools in a full-screen list' },
   { name: 'upgrade', aliases: ['update'], summary: 'Self-update ADM (bundle: atomic swap · npm: prints the npm command)',
     flags: ['--check', '--dry-run'] },
   { name: 'dotfiles sync', summary: 'Sync dotfiles from a git repo into your home dir',

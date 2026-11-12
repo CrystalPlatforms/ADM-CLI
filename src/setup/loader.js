@@ -4,7 +4,6 @@
 //
 // Frames: dots_12 from cli-spinners/cli-loaders — MIT license.
 //   https://cliloaders.com/dots_12 · https://github.com/cbmongithub/cli-loaders
-//   (frames also mirrored in the repo root loader.txt)
 //
 // Wrap-aware: install lines carry the FULL command in parentheses, so a
 // frame can span several terminal rows — every repaint erases ALL rows the

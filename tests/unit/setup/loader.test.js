@@ -1,7 +1,7 @@
 const { loader, FRAMES } = require('../../../src/setup/loader');
 
 // dots_12 loader (owner decision, 0.3.x): replaces the ASCII \|/- spinner.
-// Frames from cli-spinners/cli-loaders (MIT) — mirrored in repo loader.txt.
+// Frames from cli-spinners/cli-loaders (MIT).
 
 function fakeStdout() {
   const writes = [];

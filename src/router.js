@@ -6,6 +6,7 @@ const { runConfig } = require('./commands/config');
 const { runUninstall } = require('./commands/uninstall');
 const { runUpgrade } = require('./upgrade');
 const { runDotfilesSync } = require('./commands/dotfiles');
+const { runToolsTui } = require('./tools/tools-tui');
 const { runPlan } = require('./install/plan');
 const { runInstall } = require('./install/run');
 const { runWizard } = require('./setup/wizard');
@@ -100,6 +101,17 @@ function route(argv, deps = {}) {
   // ── upgrade / update (#32) ───────────────────────────────────
   if (head === 'upgrade' || head === 'update') {
     return runUpgrade(rest, { log, err });
+  }
+
+  // ── tools TUI (#36, phase 1 tracer) ─────────────────────────
+  if (head === 'tools') {
+    if (rest.length > 0) return usageError(`"tools" takes no arguments, got: ${rest.join(' ')}`, err);
+    // TTY guard (#26 pattern): the TUI must never hang a non-interactive stdin.
+    if (!tty) {
+      err('adm tools needs a terminal for interactive mode.');
+      return 1;
+    }
+    return (deps.tools || runToolsTui)({ log, err, tty });
   }
 
   // ── dotfiles sync ────────────────────────────────────────────

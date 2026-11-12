@@ -88,6 +88,35 @@ describe('route — usage errors enumerate the valid set', () => {
   });
 });
 
+describe('route — tools (#36 phase 1)', () => {
+  test('tools dispatches to the injected TUI runner with tty context', () => {
+    const d = sink();
+    const tools = jest.fn(() => 0);
+    const code = route(['tools'], { ...d, tools, tty: true });
+    expect(code).toBe(0);
+    expect(tools).toHaveBeenCalledTimes(1);
+    expect(tools.mock.calls[0][0]).toMatchObject({ tty: true });
+  });
+
+  test('tools without a TTY exits 1 with a terminal notice, never renders', () => {
+    const d = sink();
+    const tools = jest.fn(() => 0);
+    const code = route(['tools'], { ...d, tools, tty: false });
+    expect(code).toBe(1);
+    expect(tools).not.toHaveBeenCalled();
+    expect(d.calls.err.join('\n')).toContain('needs a terminal');
+  });
+
+  test('tools rejects arguments', () => {
+    const d = sink();
+    const tools = jest.fn(() => 0);
+    const code = route(['tools', '--extra'], { ...d, tools, tty: true });
+    expect(code).toBe(1);
+    expect(tools).not.toHaveBeenCalled();
+    expect(d.calls.err.join('\n')).toContain('"tools" takes no arguments');
+  });
+});
+
 describe('route — no-args behaviour', () => {
   test('non-TTY never hangs: exits 1 with automation hints', () => {
     const d = sink();
