@@ -10,8 +10,9 @@
 // clear (\x1b[K) + clear-to-end (\x1b[J), inside the alternate screen buffer.
 //
 // All scanning/merging lives in the terminal-neutral inventory module; this
-// component ONLY renders state and handles keys. Selected-row style (red +
-// bold + '>' pointer) mirrors the adm wizard (setup/prompts.js).
+// component ONLY renders state and handles keys. Style (owner decisions):
+// group headers ALWAYS green #167c51, bold on selection ("hover"); tool rows
+// keep the adm wizard selection style (red + bold + '>' pointer).
 
 const chalk = require('chalk');
 const { FRAMES } = require('../setup/loader');
@@ -19,7 +20,7 @@ const { scanInventory } = require('./inventory');
 
 const FRAME_INTERVAL = 80; // same cadence as setup/loader.js
 
-const HINT = '↑↓ move · Enter/Space expand/collapse · q quit';
+const HINT = '↑↓ move · Enter/Space expand/collapse · F5/Shift+R rescan · q quit';
 
 // Builds the visible rows AND the flat list of selectable positions.
 // Headers are selectable (Enter/Space target); a collapsed group hides its
@@ -40,7 +41,9 @@ function buildView(result, selected, collapsed) {
     const isCollapsed = collapsed.has(g.id);
     const sel = idx === selected;
     const header = `${g.label} (${g.entries.length}) ${isCollapsed ? '▸' : '▾'}`;
-    rows.push(sel ? chalk.red.bold(`> ${header}`) : `  ${header}`);
+    // owner decision (#37 follow-up): headers are ALWAYS green #167c51 and
+    // gain bold on "hover" (the selection cursor — this TUI is keyboard-only)
+    rows.push(sel ? chalk.hex('#167c51').bold(`> ${header}`) : chalk.hex('#167c51')(`  ${header}`));
     selectable.push({ type: 'header', id: g.id, rowIndex: rows.length - 1 });
     idx += 1;
     if (g.warning) {
@@ -59,6 +62,8 @@ function buildView(result, selected, collapsed) {
 }
 
 // Same key mapping contract as ink's useInput (whole-chunk matches).
+// F5 arrives as CSI 15~; Shift+R as a plain capital R. Lowercase r is
+// RESERVED for remove (Phase 4) — it must never trigger a rescan.
 function parseKey(chunk) {
   const input = String(chunk);
   return {
@@ -68,6 +73,8 @@ function parseKey(chunk) {
     space: input === ' ',
     q: input === 'q',
     ctrlC: input === '\u0003',
+    f5: input === '\u001B[15~',
+    shiftR: input === 'R',
   };
 }
 
@@ -185,6 +192,45 @@ function createToolsApp({ scan, stdout, stdin, onExit, viewportRows }) {
     render();
   };
 
+  // dots_12 loader loop — runs ONLY while scanning (result === null); it
+  // self-clears once the scan resolves. Re-created by rescan().
+  const startLoader = () => {
+    if (frameTimer) clearInterval(frameTimer);
+    frameTimer = setInterval(() => {
+      if (result) { clearInterval(frameTimer); frameTimer = null; return; }
+      frame += 1;
+      render();
+    }, FRAME_INTERVAL);
+  };
+
+  const onScanProgress = (done, total) => {
+    progress = { done, total };
+    render();
+  };
+
+  const applyResult = (res) => {
+    result = res;
+    cursor = { selected: 0, top: 0 };
+    if (frameTimer) { clearInterval(frameTimer); frameTimer = null; }
+    render();
+  };
+
+  // FULL manual rescan (F5 / Shift+R): drops the current result, restarts the
+  // loader and reruns the scan from scratch. Never runs while a scan is
+  // already in flight (result === null IS the scanning state).
+  const rescan = () => {
+    if (!result) return;
+    result = null;
+    progress = null;
+    frame = 0;
+    cursor = { selected: 0, top: 0 };
+    startLoader();
+    render();
+    Promise.resolve()
+      .then(() => scan(onScanProgress))
+      .then(applyResult);
+  };
+
   const onData = (chunk) => {
     if (dead) return;
     const key = parseKey(chunk);
@@ -196,6 +242,8 @@ function createToolsApp({ scan, stdout, stdin, onExit, viewportRows }) {
     if (key.up) move(-1);
     else if (key.down) move(1);
     else if (key.enter || key.space) toggle();
+    else if (key.f5 || key.shiftR) rescan();
+    // lowercase r: intentionally unbound (remove in Phase 4)
   };
 
   const stop = () => {
@@ -219,22 +267,10 @@ function createToolsApp({ scan, stdout, stdin, onExit, viewportRows }) {
       stdout.write('\x1b[?25l'); // hide cursor (loader contract)
       stdin.on('data', onData);
       render();
-      frameTimer = setInterval(() => {
-        if (result) { clearInterval(frameTimer); frameTimer = null; return; }
-        frame += 1;
-        render();
-      }, FRAME_INTERVAL);
+      startLoader();
       Promise.resolve()
-        .then(() => scan((done, total) => {
-          progress = { done, total };
-          render();
-        }))
-        .then(res => {
-          result = res;
-          cursor = { selected: 0, top: 0 };
-          if (frameTimer) { clearInterval(frameTimer); frameTimer = null; }
-          render();
-        });
+        .then(() => scan(onScanProgress))
+        .then(applyResult);
     },
     stop,
     isDead: () => dead,
@@ -276,4 +312,4 @@ async function runToolsTui(opts = {}) {
   return 0;
 }
 
-module.exports = { createToolsApp, runToolsTui };
+module.exports = { createToolsApp, runToolsTui, buildView };

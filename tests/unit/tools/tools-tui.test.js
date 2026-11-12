@@ -37,7 +37,7 @@ const os = require('os');
 const path = require('path');
 const { Writable } = require('stream');
 const { EventEmitter } = require('events');
-const { createToolsApp, runToolsTui } = require('../../../src/tools/tools-tui');
+const { createToolsApp, runToolsTui, buildView } = require('../../../src/tools/tools-tui');
 const { scanInventory } = require('../../../src/tools/inventory');
 const { FRAMES } = require('../../../src/setup/loader');
 
@@ -52,15 +52,21 @@ function screenText(stdout) {
 const linesOf = frame => frame.split('\n').map(l => l.replace(/^>\s/, '').trim()).filter(Boolean);
 
 // real inventory module behind the injected scan fn — the TUI contract is
-// "whatever scanInventory returns", so tests go through the public interface
+// "whatever scanInventory returns", so tests go through the public interface.
+// #37: the remaining manager probes are stubbed with SILENT SUCCESS (empty
+// output → empty groups, no warnings) so the scan resolves synchronously and
+// the frames stay the Phase 1 shape (ADM + npm + other only).
 const scanFixtures = onProgress => {
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'adm-tui-path-'));
   fs.writeFileSync(path.join(binDir, 'fzf'), '#!/bin/sh\n'); // PATH-only hit → 'other'
+  const goBin = fs.mkdtempSync(path.join(os.tmpdir(), 'adm-tui-gobin-'));
   return scanInventory({
     registry: [{ id: 'typescript', name: 'TypeScript', method: 'npm', installedAt: '2026-01-01T00:00:00.000Z' }],
     npmJson: JSON.stringify({ dependencies: { eslint: { version: '9.0.0' } } }),
     catalog: [{ id: 'fzf', name: 'fzf' }],
     env: { PATH: binDir },
+    execFunc: (cmd, _o, cb) => cb(null, ''),
+    goBinDir: goBin,
     onProgress,
   });
 };
@@ -287,6 +293,8 @@ describe('tools TUI (skin)', () => {
         npmJson: JSON.stringify({ dependencies: { pkg: { version: '1.0.0' } } }),
         catalog,
         env: { PATH: binDir },
+        execFunc: (cmd, _o, cb) => cb(null, ''),
+        goBinDir: fs.mkdtempSync(path.join(os.tmpdir(), 'adm-tui-warn-gobin-')),
         onProgress,
       });
     };
@@ -325,6 +333,8 @@ describe('tools TUI (skin)', () => {
         npmJson: JSON.stringify({ dependencies: {} }),
         catalog,
         env: { PATH: binDir },
+        execFunc: (cmd, _o, cb) => cb(null, ''),
+        goBinDir: fs.mkdtempSync(path.join(os.tmpdir(), 'adm-tui-rows-gobin-')),
         onProgress,
       });
     };
@@ -360,6 +370,8 @@ describe('tools TUI (skin)', () => {
         npmJson: JSON.stringify({ dependencies: {} }),
         catalog,
         env: { PATH: binDir },
+        execFunc: (cmd, _o, cb) => cb(null, ''),
+        goBinDir: fs.mkdtempSync(path.join(os.tmpdir(), 'adm-tui-tall-gobin-')),
         onProgress,
       });
     };
@@ -411,7 +423,33 @@ describe('tools TUI (skin)', () => {
     expect(rawLines(t.stdout)).toContain('> npm (1) ▾'); // selection did not move
   });
 
-  test('selected row renders red+bold like the adm wizard pointer', async () => {
+  test('group headers ALWAYS render green #167c51; bold only while selected (hover)', async () => {
+    const chalk = require('chalk');
+    const prev = chalk.level;
+    chalk.level = 3; // truecolor — deterministic escape bytes (#167c51 = 22;124;81)
+    try {
+      const t = mount();
+      await flush();
+      await flush();
+      const GREEN = '\x1b[38;2;22;124;81m';
+      const frame = t.stdout.writes[t.stdout.writes.length - 1];
+      // selected header (hover): green + bold + pointer
+      expect(frame).toContain(GREEN);
+      expect(frame).toContain('\x1b[1m');
+      expect(strip(frame)).toContain('> ADM (1) ▾');
+
+      // selection moved onto a tool row: the header stays green but is NOT bold
+      t.inDev.press('\x1b[B');
+      const f2 = t.stdout.writes[t.stdout.writes.length - 1];
+      const admLine = f2.split('\n').find(l => strip(l).includes('ADM (1) ▾'));
+      expect(admLine).toContain(GREEN);
+      expect(admLine).not.toContain('\x1b[1m');
+    } finally {
+      chalk.level = prev;
+    }
+  });
+
+  test('selected tool row renders red+bold like the adm wizard pointer', async () => {
     const chalk = require('chalk');
     const prev = chalk.level;
     chalk.level = 2; // wizard-style colors ON for this test only (setup forces 0)
@@ -419,10 +457,11 @@ describe('tools TUI (skin)', () => {
       const t = mount();
       await flush();
       await flush();
+      t.inDev.press('\x1b[B'); // onto the TypeScript tool row
       const frame = t.stdout.writes[t.stdout.writes.length - 1];
       expect(frame).toContain('\x1b[31m'); // red
       expect(frame).toContain('\x1b[1m');  // bold
-      expect(strip(frame)).toContain('> ADM (1) ▾'); // the pointer row is the selected one
+      expect(strip(frame)).toContain('> TypeScript'); // the pointer row is the selected one
     } finally {
       chalk.level = prev;
     }
@@ -460,5 +499,98 @@ describe('tools TUI (skin)', () => {
     const code = await runToolsTui({ tty: false, err: s => errLines.push(s) });
     expect(code).toBe(1);
     expect(errLines.join('\n')).toContain('needs a terminal');
+  });
+
+  // ---- #37 Phase 2: rescan (F5 / Shift+R; lowercase r NEVER rescans) ----
+
+  const mountCountingScan = () => {
+    let calls = 0;
+    let pending = []; // gates armed by deferNext() — the next scan waits on one
+    const scan = onProgress => {
+      calls += 1;
+      const run = () => scanFixtures(onProgress);
+      if (pending.length > 0) return pending.shift().then(run);
+      return Promise.resolve(run());
+    };
+    return {
+      mount: () => mount({ scan }),
+      calls: () => calls,
+      deferNext: () => {
+        let release;
+        pending.push(new Promise(res => { release = res; }));
+        return release; // sync gate fn
+      },
+    };
+  };
+
+  test('F5 triggers a full rescan: loader returns, scan runs again, cursor resets to top', async () => {
+    const c = mountCountingScan();
+    const t = c.mount();
+    await flush();
+    await flush();
+    expect(c.calls()).toBe(1);
+    expect(screenText(t.stdout)).toContain('rescan'); // hint advertises the new keys
+
+    t.inDev.press('\x1b[B'); // selection moves off the top
+    expect(rawLines(t.stdout)).toContain('> TypeScript');
+
+    const gate = c.deferNext(); // hold the SECOND scan open
+    t.inDev.press('\x1b[15~'); // F5
+    await flush();
+    expect(c.calls()).toBe(2);
+    expect(screenText(t.stdout)).toContain('Scanning'); // loader replaces the list
+
+    t.inDev.press('\x1b[15~'); // F5 during an in-flight scan is a no-op
+    await flush();
+    expect(c.calls()).toBe(2);
+
+    gate(); // release the second scan
+    await flush();
+    await flush();
+    expect(rawLines(t.stdout)).toContain('> ADM (1) ▾'); // cursor reset to top
+    expect(screenText(t.stdout)).toContain('TypeScript'); // fresh list rendered
+  });
+
+  test('Shift+R triggers the same full rescan', async () => {
+    const c = mountCountingScan();
+    const t = c.mount();
+    await flush();
+    await flush();
+    t.inDev.press('R');
+    await flush();
+    expect(c.calls()).toBe(2);
+    await flush();
+    await flush();
+    expect(screenText(t.stdout)).toContain('TypeScript'); // list is back
+  });
+
+  test('lowercase r does NOT rescan (reserved for remove in Phase 4)', async () => {
+    const c = mountCountingScan();
+    const t = c.mount();
+    await flush();
+    await flush();
+    t.inDev.press('r');
+    await flush();
+    await flush();
+    expect(c.calls()).toBe(1);
+    expect(screenText(t.stdout)).toContain('TypeScript'); // still the list, no loader
+  });
+
+  test('buildView (model): a collapsed group keeps its header + count but drops rows and selectable positions', () => {
+    const result = {
+      groups: [
+        { id: 'npm', label: 'npm', entries: [{ id: 'eslint', name: 'eslint' }], warning: null },
+        { id: 'other', label: 'other', entries: [{ id: 'fzf', name: 'fzf' }], warning: null },
+      ],
+    };
+    const open = buildView(result, 0, new Set());
+    expect(open.rows).toHaveLength(4); // hdr + eslint + hdr + fzf
+    expect(open.selectable).toHaveLength(4);
+
+    const collapsed = buildView(result, 0, new Set(['npm']));
+    expect(collapsed.rows).toHaveLength(3); // npm hdr + other hdr + fzf
+    expect(collapsed.rows[0]).toContain('npm (1) ▸'); // count stays, arrow flips
+    expect(collapsed.rows.join('\n')).not.toContain('eslint');
+    expect(collapsed.selectable.map(s => s.id)).toEqual(['npm', 'other', 'fzf']);
   });
 });
