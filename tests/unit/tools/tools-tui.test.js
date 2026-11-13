@@ -37,7 +37,7 @@ const os = require('os');
 const path = require('path');
 const { Writable } = require('stream');
 const { EventEmitter } = require('events');
-const { createToolsApp, runToolsTui, buildView, buildPanel } = require('../../../src/tools/tools-tui');
+const { createToolsApp, runToolsTui, buildView, buildPanel, fuzzyMatch, filterTools } = require('../../../src/tools/tools-tui');
 const { scanInventory } = require('../../../src/tools/inventory');
 const { FRAMES } = require('../../../src/setup/loader');
 
@@ -736,7 +736,9 @@ describe('tools TUI (skin)', () => {
     await flush();
     await flush();
     inDev.press('\x1b[B'); // a tool row → panel filled
-    const firstLine = screenText(stdout).split('\n')[0];
+    // the search field box (always visible) occupies the first frame lines —
+    // measure the separator on a LIST row
+    const firstLine = screenText(stdout).split('\n').find(l => l.includes('ADM ('));
     const sepIdx = firstLine.indexOf('│');
     expect(sepIdx).toBeGreaterThanOrEqual(79);
     expect(sepIdx).toBeLessThanOrEqual(84);
@@ -1305,5 +1307,297 @@ describe('tools TUI actions (Phase 4 + 5)', () => {
     app = createToolsApp({ scan: scanFixtures, stdout, stdin: inDev.stdin });
     app.run();
     expect(screenText(stdout)).toContain('terminal too small');
+  });
+});
+
+// ── #41: the `/` search field — fuzzy view of the scanned tools.
+//
+// Assumptions encoded by these tests (stated before RED, 2026-11-12):
+// - `/` opens the field (the FIRST frame line: `/ <query>█`, dim placeholder
+//   when empty); while it is active EVERY keystroke TYPES — including 'q'
+//   (only Ctrl+C still exits). Backspace deletes, Esc cancels (pre-search
+//   selection restored), Enter confirms (the highlighted match stays
+//   selected in the full list).
+// - The view behind ↑↓/rendering is the FUZZY filter: substring ranks above
+//   subsequence, matching on name OR id; groups without a match disappear;
+//   an empty query is a passthrough (the same result object).
+// - A new query restarts the selection at the best match; a fresh scan
+//   clears the search entirely.
+describe('tools TUI search field (/)', () => {
+  let app;
+  afterEach(() => { if (app) { app.stop(); app = null; } });
+
+  // local mount (the actions describe keeps its own — search needs no exec)
+  const mountSearch = (props = {}) => {
+    const stdout = fakeStdout();
+    const inDev = fakeStdin();
+    app = createToolsApp({ scan: scanFixtures, stdout, stdin: inDev.stdin, ...props });
+    app.run();
+    return { stdout, inDev };
+  };
+  const selectFirstTool = async t => {
+    await flush();
+    await flush();
+    t.inDev.press('\x1b[B'); // ADM header → TypeScript
+  };
+
+  const modelResult = () => ({
+    entries: [
+      { id: 'typescript', name: 'TypeScript', source: 'adm' },
+      { id: 'eslint', name: 'eslint', source: 'npm' },
+      { id: 'fzf', name: 'fzf', source: 'other' },
+    ],
+    groups: [
+      { id: 'adm', label: 'ADM', warning: 'ADM registry not found', entries: [{ id: 'typescript', name: 'TypeScript', source: 'adm' }] },
+      { id: 'npm', label: 'npm', warning: null, entries: [{ id: 'eslint', name: 'eslint', source: 'npm' }] },
+      { id: 'other', label: 'other', warning: null, entries: [{ id: 'fzf', name: 'fzf', source: 'other' }] },
+    ],
+  });
+
+  test('fuzzyMatch: substring ranks above subsequence; no match is null', () => {
+    expect(fuzzyMatch('type', 'TypeScript')).toBe(1000); // substring at index 0
+    expect(fuzzyMatch('ts', 'typescript')).toBe(100);    // subsequence
+    expect(fuzzyMatch('zzz', 'eslint')).toBeNull();
+    expect(fuzzyMatch('', 'anything')).toBe(0);          // empty query matches all
+  });
+
+  test('filterTools: best matches first, empty groups disappear, entries reused, empty query passthrough', () => {
+    const result = modelResult();
+    const view = filterTools(result, 'ts');
+    // 'ts' matches typescript (subsequence of name AND substring of id) — fzf/eslint drop out
+    expect(view.entries.map(e => e.id)).toEqual(['typescript']);
+    expect(view.groups.find(g => g.id === 'adm').warning).toBe('ADM registry not found'); // kept group keeps its warning
+    expect(view.groups.find(g => g.id === 'npm')).toBeUndefined();
+    expect(view.entries[0]).toBe(result.groups[0].entries[0]); // REUSED object, not a clone
+
+    expect(filterTools(result, '')).toBe(result); // empty query → the same object
+  });
+
+  test('filterTools ranks substring above subsequence', () => {
+    const result = {
+      entries: [],
+      groups: [{
+        id: 'g', label: 'g', warning: null,
+        entries: [
+          { id: 'setuptools', name: 'setuptools' },  // 'set' substring at 0 → best
+          { id: 'assettool', name: 'assettool' },    // 'set' substring later
+          { id: 's-e-t-x', name: 's-e-t-x' },        // 'set' subsequence only
+        ],
+      }],
+    };
+    const view = filterTools(result, 'set');
+    expect(view.entries.map(e => e.id)).toEqual(['setuptools', 'assettool', 's-e-t-x']);
+  });
+
+  test('the field is ALWAYS visible with a round border; / focuses it (real terminal cursor)', async () => {
+    const stdout = fakeStdout();
+    const inDev = fakeStdin();
+    app = createToolsApp({ scan: scanFixtures, stdout, stdin: inDev.stdin });
+    app.run();
+    await flush(); await flush();
+
+    // always visible: round corners + '? ' icon + placeholder, NO fake cursor
+    let frame = screenText(stdout);
+    expect(frame).toContain('╭');
+    expect(frame).toContain('? Search tools…');
+    expect(frame).not.toContain('█');
+    expect(frame).toContain('/ search'); // the pinned hint
+
+    inDev.press('/'); // focus → the REAL terminal cursor is parked inside
+    const last = stdout.writes[stdout.writes.length - 1];
+    expect(last).toContain('\x1b[2;');     // cursor positioned in the field row
+    expect(last).toContain('\x1b[?25h');   // terminal's own cursor (its style)
+    expect(screenText(stdout)).toContain('? Search tools…'); // placeholder + cursor behind it
+
+    inDev.press('\u0003'); // Ctrl+C still exits from the search field
+  });
+
+  test('typing filters the list; q TYPES instead of quitting; backspace deletes', async () => {
+    const t = mountSearch();
+    await selectFirstTool(t);
+    t.inDev.press('/');
+    t.inDev.press('t');
+    t.inDev.press('y');
+    t.inDev.press('p');
+    await flush();
+    let frame = screenText(t.stdout);
+    expect(frame).toContain('? typ');
+    expect(frame).toContain('TypeScript');
+    expect(frame).not.toContain('eslint');  // filtered out
+    expect(frame).not.toContain('fzf');     // filtered out
+
+    t.inDev.press('q'); // a LETTER here, not quit — 'typq' has NO matches
+    await flush();
+    frame = screenText(t.stdout);
+    expect(frame).toContain('? typq');
+    expect(frame).toContain('no tools match');
+
+    t.inDev.press('\u007F'); // backspace removes 'q'
+    await flush();
+    expect(screenText(t.stdout)).toContain('? typ');
+    expect(screenText(t.stdout)).toContain('TypeScript'); // matches are back
+
+    t.inDev.press('e');
+    t.inDev.press('\r'); // Enter confirms → focus leaves the field, match selected
+    await flush();
+    const closed = screenText(t.stdout);
+    expect(closed).toContain('? typ');        // the query persists (owner round 4)
+    expect(closed).toContain('> TypeScript'); // selection on the match
+    expect(closed).not.toContain('eslint');   // the view stays filtered
+  });
+
+  test('Enter confirms the BEST match and hands the focus back to the list', async () => {
+    const t = mountSearch();
+    await selectFirstTool(t);
+    t.inDev.press('/');
+    t.inDev.press('t'); // matches TypeScript (substring) AND eslint (subsequence 't')
+    await flush();
+    const frame = screenText(t.stdout);
+    expect(frame).toContain('TypeScript');
+    expect(frame).toContain('eslint');
+    expect(frame).not.toContain('fzf');
+
+    t.inDev.press('\r'); // Enter — the field had no hover: the BEST match wins
+    await flush();
+    const closed = screenText(t.stdout);
+    expect(closed).toContain('> TypeScript');   // mapped back onto the FULL list
+    // the query PERSISTS (owner round 4): the bar keeps it, the filter stays —
+    // fzf matches no 't' and stays filtered out
+    expect(closed).not.toContain('fzf');
+    expect(closed).toContain('eslint');
+    expect(closed).toContain('? t');
+  });
+
+  test('↑ at the very top of the list moves the focus INTO the field; ↓ returns to the list', async () => {
+    const t = mountSearch();
+    await flush(); await flush(); // selection sits on the first row (ADM header)
+    t.inDev.press('\x1b[A'); // ↑ past the top → INTO the field
+    await flush();
+    let last = t.stdout.writes[t.stdout.writes.length - 1];
+    expect(last).toContain('\x1b[?25h'); // the terminal cursor lives in the field
+    expect(last).toContain('\x1b[2;5H'); // parked right after the '? ' icon
+
+    // while the field is focused the list hover is SUPPRESSED (chalk level 3
+    // makes the red pointer detectable — setup-jest forces level 0 otherwise)
+    const chalk = require('chalk');
+    const prev = chalk.level;
+    chalk.level = 3;
+    try {
+      t.inDev.press('t'); // typing → the best match is selected INTERNALLY
+      await flush();
+      // RAW write (screenText strips ANSI): no red hover while the field owns the cursor
+      let raw = t.stdout.writes[t.stdout.writes.length - 1];
+      expect(raw).toContain('TypeScript');
+      expect(raw).not.toContain('\u001B[31m');
+
+      t.inDev.press('\x1b[B'); // ↓ → focus back to the list, hover restored
+      await flush();
+      raw = t.stdout.writes[t.stdout.writes.length - 1];
+      expect(raw).toContain('\u001B[31m'); // the red pointer is back (best match)
+    } finally {
+      chalk.level = prev;
+    }
+    last = t.stdout.writes[t.stdout.writes.length - 1];
+    expect(last).toContain('\x1b[?25l'); // the field cursor is hidden again
+  });
+
+  test('the frame NEVER exceeds the terminal height (the box top must not scroll off)', async () => {
+    // a TALL list + the 3 field rows must still fit: the window shrinks
+    const bigScan = async () => {
+      const groups = [{
+        id: 'npm', label: 'npm', warning: null,
+        entries: Array.from({ length: 60 }, (_, i) => ({ id: `tool-${i}`, name: `tool-${i}`, version: '1.0.0', binPath: null, source: 'npm', manager: 'npm', installedAt: null })),
+      }];
+      return { entries: groups[0].entries, groups };
+    };
+    const stdout = fakeStdout();
+    stdout.rows = 30;
+    const inDev = fakeStdin();
+    app = createToolsApp({ scan: bigScan, stdout, stdin: inDev.stdin });
+    app.run();
+    await flush(); await flush();
+    const lines = screenText(stdout).split('\n');
+    expect(lines.length).toBeLessThanOrEqual(30); // no scroll → nothing cut off
+    expect(screenText(stdout)).toContain('╭');    // the box top border is on screen
+  });
+
+  test('Esc LEAVES the field without resetting: query + filter stay, hover lands on the best match', async () => {
+    const t = mountSearch();
+    await selectFirstTool(t); // selection on TypeScript
+    t.inDev.press('/');
+    t.inDev.press('f');
+    t.inDev.press('z');
+    await flush();
+    expect(screenText(t.stdout)).toContain('? fz');
+
+    t.inDev.press('\u001B'); // leave the field — NOT a reset anymore
+    await flush();
+    const frame = screenText(t.stdout);
+    expect(frame).toContain('? fz');          // the query persists
+    expect(frame).toContain('> fzf');         // hover lands on the best match
+    expect(frame).not.toContain('eslint');    // the view STAYS filtered
+    expect(frame).not.toContain('TypeScript');
+
+    // '/' re-focuses with the query intact; emptying it restores ALL tools
+    t.inDev.press('/');
+    await flush();
+    t.inDev.press('\u007F');
+    t.inDev.press('\u007F');
+    await flush();
+    const cleared = screenText(t.stdout);
+    expect(cleared).toContain('? Search tools…'); // placeholder is back
+    expect(cleared).toContain('eslint');          // all tools returned
+    expect(cleared).toContain('TypeScript');
+  });
+
+  test('←/→ move the insertion point; typing inserts AT it; Backspace/Delete remove around it', async () => {
+    const t = mountSearch();
+    await selectFirstTool(t);
+    t.inDev.press('/');
+    t.inDev.press('t');
+    t.inDev.press('s');
+    await flush();
+    expect(screenText(t.stdout)).toContain('TypeScript'); // 'ts' matches
+
+    t.inDev.press('\x1b[D'); // ←
+    t.inDev.press('\x1b[D'); // ←  → insertion point at 0
+    t.inDev.press('x');       // insert AT 0 → 'xts' (point now after 'x')
+    await flush();
+    let frame = screenText(t.stdout);
+    expect(frame).toContain('? xts');
+    expect(frame).toContain('no tools match');
+
+    t.inDev.press('\u007F'); // Backspace removes BEFORE the point ('x')
+    await flush();
+    frame = screenText(t.stdout);
+    expect(frame).toContain('? ts');
+    expect(frame).toContain('TypeScript'); // matches are back
+
+    t.inDev.press('\u001B[D'); // ← to the very start
+    t.inDev.press('\u001B[3~'); // Delete removes AT the point ('t') → 's'
+    await flush();
+    expect(screenText(t.stdout)).toContain('? s');
+
+    t.inDev.press('\u001B[C'); // → walk back toward the end
+    t.inDev.press('\u001B[C');
+    t.inDev.press('\r'); // confirm — the highlighted match stays selected
+    await flush();
+    expect(screenText(t.stdout)).toContain('? s'); // the query persists
+    expect(screenText(t.stdout)).toContain('> TypeScript');
+  });
+
+  test('a fresh scan (F5) clears the search entirely', async () => {
+    const t = mountSearch();
+    await selectFirstTool(t);
+    t.inDev.press('/');
+    t.inDev.press('f');
+    await flush();
+    expect(screenText(t.stdout)).toContain('? f');
+    t.inDev.press('\u001B[15~'); // F5
+    await flush(); await flush(); await flush();
+    const frame = screenText(t.stdout);
+    expect(frame).not.toContain('? f');
+    expect(frame).toContain('? Search tools…'); // idle placeholder is back
+    expect(frame).toContain('TypeScript'); // full list after the rescan
   });
 });

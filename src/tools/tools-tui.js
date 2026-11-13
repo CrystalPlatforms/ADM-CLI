@@ -22,7 +22,12 @@ const toolActions = require('./tool-actions');
 
 const FRAME_INTERVAL = 80; // same cadence as setup/loader.js
 
-const HINT = '↑↓ move · →/← actions · Enter/Space collapse · F5/Shift+R rescan · q quit';
+const HINT = '↑↓ move · / search · →/← actions · Enter/Space collapse · F5/Shift+R rescan · q quit';
+
+// The /-search field (issue #41): ALWAYS visible in a round-bordered box.
+const SEARCH_ICON = '? ';
+const SEARCH_PLACEHOLDER = 'Search tools…';
+const FIELD_ROWS = 3; // box top border + content + bottom border
 
 // strips ANSI so visible widths can be computed (padding/truncation)
 const stripAnsi = s => String(s).replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
@@ -83,6 +88,49 @@ function buildPanel(info, { width = 30, focusButton = -1 } = {}) {
     else lines.push(chalk.dim(`  ${text}`));
   });
   return lines;
+}
+
+// Fuzzy score of query against text (case-insensitive), or null = no match.
+// Substring ranks high (earlier occurrence = better); a plain subsequence
+// ('ts' in 'typescript') still matches — classic fuzzy-search feel.
+function fuzzyMatch(query, text) {
+  const q = String(query).toLowerCase();
+  const t = String(text).toLowerCase();
+  if (!q) return 0;
+  const at = t.indexOf(q);
+  if (at >= 0) return 1000 - at;
+  let i = 0;
+  for (let k = 0; k < t.length && i < q.length; k += 1) {
+    if (t[k] === q[i]) i += 1;
+  }
+  return i === q.length ? 100 : null;
+}
+
+// Pure fuzzy VIEW of the scan result behind the `/` search field. Tool rows
+// match on name OR id; groups without a single match disappear entirely.
+// Entries are REUSED (never cloned) so panel references stay valid, and the
+// best matches per group sort first. Empty query → the result as-is.
+function filterTools(result, query) {
+  const q = String(query || '').trim();
+  if (!q || !result) return result;
+  const groups = [];
+  const entries = [];
+  for (const g of result.groups) {
+    const scored = [];
+    for (const e of g.entries) {
+      const score = Math.max(
+        fuzzyMatch(q, e.name) === null ? -1 : fuzzyMatch(q, e.name),
+        fuzzyMatch(q, e.id) === null ? -1 : fuzzyMatch(q, e.id),
+      );
+      if (score >= 0) scored.push({ e, score });
+    }
+    if (scored.length === 0) continue;
+    scored.sort((a, b) => b.score - a.score);
+    const kept = scored.map(s => s.e);
+    groups.push({ ...g, entries: kept });
+    entries.push(...kept);
+  }
+  return { entries, groups };
 }
 
 // Builds the visible rows AND the flat list of selectable positions.
@@ -187,6 +235,29 @@ function buildMinSizeScreen(columns, rows) {
   ];
 }
 
+// The search field box: round corners (╭ ╮ ╰ ╯), one-line content row with
+// paddingX 1, the '? ' icon and the placeholder when empty. The width is the
+// FULL LIST COLUMN (owner: from the screen's left edge to the sidebar
+// separator line), so the box's right edge aligns with the '│' divider.
+function searchFieldWidth(columns = 80) {
+  const cols = Number.isFinite(columns) ? columns : 80;
+  const listWidth = Math.max(44, Math.min(cols - 22, Math.floor(cols * 0.85)));
+  // TWO chars narrower than the separator column — a full gap column between
+  // the box's right edge and the sidebar divider (owner: it still cut in)
+  return listWidth;
+}
+
+function buildSearchField(search, width = searchFieldWidth()) {
+  const query = search ? search.query : '';
+  const text = query ? query : chalk.dim(SEARCH_PLACEHOLDER);
+  const inner = padCell(` ${SEARCH_ICON}${text}`, width - 2);
+  return [
+    chalk.dim(`╭${'─'.repeat(width - 2)}╮`),
+    `${chalk.dim('│')}${inner}${chalk.dim('│')}`,
+    chalk.dim(`╰${'─'.repeat(width - 2)}╯`),
+  ];
+}
+
 // Same key mapping contract as ink's useInput (whole-chunk matches).
 // F5 arrives as CSI 15~; Shift+R as a plain capital R. Lowercase r is
 // remove (opens the confirm dialog — #39); u/f/c trigger update/reveal.
@@ -211,6 +282,11 @@ function parseKey(chunk) {
     c: input === 'c',
     y: input === 'y',
     n: input === 'n',
+    slash: input === '/',
+    backspace: input === '\u007F' || input === '\b',
+    del: input === '\u001B[3~',
+    // any non-control chunk (letters, digits, paste) — typed into the search
+    printable: input.length > 0 && !/[\u0000-\u001F\u007F]/.test(input),
   };
 }
 
@@ -240,7 +316,12 @@ function createToolsApp({ scan, stdout, stdin, onExit, viewportRows, toolInfo: t
   let buttonIdx = 0;          // hovered button when focus === 'buttons'
   let dialog = null;          // { entryId, name, stage: 'sure'|'cache' } | null
   let actionState = null;     // { kind, entryId, name, status, steps?, stepIndex?, command?, message?, startedAt?, frame?, currentCommand? } | null
+  let search = null;          // { query, pos, prev: {selected, top} } | null — the / search field
   const collapsed = new Set();
+
+  // The result VIEW behind every coordinate-aware helper: the fuzzy-filtered
+  // result while the search field holds a query, the raw result otherwise.
+  const viewResult = () => (search && search.query && result ? filterTools(result, search.query) : result);
   let frameTimer = null;
   let frame = 0;
   let dead = false;           // stopped accepting keys / rendering
@@ -257,7 +338,10 @@ function createToolsApp({ scan, stdout, stdin, onExit, viewportRows, toolInfo: t
     if (viewportRows) return Math.max(3, viewportRows);
     const rows = stdout.rows;
     const sane = Number.isFinite(rows) && rows >= 8 && rows <= 100;
-    return Math.max(5, sane ? Math.min(rows - 3, MAX_WINDOW) : 20);
+    // rows-6: 3 rows go to the ALWAYS-VISIBLE search field + 3 clearance —
+    // a frame taller than the window SCROLLS the top border off (owner
+    // report: the box looked "half cut" until the filtered list got short)
+    return Math.max(5, sane ? Math.min(rows - 6, MAX_WINDOW) : 17);
   };
 
   const clampIdx = (n, len) => Math.max(0, Math.min(len - 1, n));
@@ -266,8 +350,30 @@ function createToolsApp({ scan, stdout, stdin, onExit, viewportRows, toolInfo: t
   // clear-to-end, so a shrinking frame never leaves residue. Frame lines
   // must stay within one terminal row (Phase 1 content is short); the
   // trailing \x1b[J clears leftovers of any taller previous frame.
-  const paint = (lines, withHint = true) => {
+  //
+  // tail (owner request, #41 round 2): while the search field is focused the
+  // REAL terminal cursor is parked inside it (style owned by the terminal —
+  // block/beam — never a drawn block). Frames without the field re-hide it.
+  let fieldCursorShown = false;
+  const fieldCursorSeq = (columns) => {
+    const width = searchFieldWidth(columns);
+    // EMPTY query → the cursor sits right after the '? ' icon, INSIDE the box
+    // (parking it behind the placeholder landed on the right border — half
+    // outside the frame, owner report); otherwise at the insertion point,
+    // clamped so a clipped long query can never push it outside.
+    const pos = search.query ? search.pos : 0;
+    const col = Math.min(5 + pos, width - 1);
+    fieldCursorShown = true;
+    return `\x1b[2;${col}H\x1b[?25h`;
+  };
+  const paint = (lines, withHint = true, tail) => {
     if (dead) return;
+    let seq = tail;
+    if (seq === undefined) {
+      if (search && search.focused) seq = fieldCursorSeq(stdout.columns || 80);
+      else if (fieldCursorShown) { seq = '\x1b[?25l'; fieldCursorShown = false; }
+      else seq = '';
+    }
     const body = lines.map(l => `${l}\x1b[K`).join('\n');
     const rows = stdout.rows;
     const sane = Number.isFinite(rows) && rows >= 8 && rows <= 100;
@@ -277,11 +383,11 @@ function createToolsApp({ scan, stdout, stdin, onExit, viewportRows, toolInfo: t
       // \x1b[J first clears leftovers of any taller previous frame (and the
       // previous hint), then the hint is written at row `rows`.
       const hint = withHint ? `\x1b[${rows};1H${chalk.dim(HINT)}\x1b[K` : '';
-      stdout.write(`\x1b[H${body}\n\x1b[J${hint}`);
+      stdout.write(`\x1b[H${body}\n\x1b[J${hint}${seq}`);
     } else {
       // rows unusable (lying console) — keep the hint right below the frame
       const hint = withHint ? `${chalk.dim(HINT)}\x1b[K` : '';
-      stdout.write(`\x1b[H${body}\x1b[K\n\x1b[J${hint}`);
+      stdout.write(`\x1b[H${body}\x1b[K\n\x1b[J${hint}${seq}`);
     }
   };
 
@@ -291,7 +397,7 @@ function createToolsApp({ scan, stdout, stdin, onExit, viewportRows, toolInfo: t
     // list, dialogs) — no broken layout is ever drawn.
     const tooSmall = (Number.isFinite(stdout.columns) && stdout.columns < 80)
       || (Number.isFinite(stdout.rows) && stdout.rows < 24);
-    if (tooSmall) { paint(buildMinSizeScreen(stdout.columns, stdout.rows), false); return; }
+    if (tooSmall) { paint(buildMinSizeScreen(stdout.columns, stdout.rows), false, ''); return; }
     if (dialog) { paint(buildDialog(dialog), false); return; }
     if (actionState) { paint(buildActionFrame(actionState, { columns: stdout.columns || 80 }), false); return; }
     if (!result) {
@@ -302,13 +408,45 @@ function createToolsApp({ scan, stdout, stdin, onExit, viewportRows, toolInfo: t
       return;
     }
     const { selected, top } = cursor;
-    const { rows, selectable } = buildView(result, selected, collapsed, focus === 'list');
+    // owner rule: the LIST HOVER and the FOCUSED search field are mutually
+    // exclusive — the bar is persistent now, so only its FOCUS hides the
+    // red pointer (an unfocused bar with a query keeps the hover visible)
+    const { rows, selectable } = buildView(viewResult(), selected, collapsed, focus === 'list' && !(search && search.focused));
     // Window = FRAME rows from selectable[top] to selectable[top + height - 1]
     // (mapping through rowIndex — warning rows shift the two coordinate
     // systems, and slicing rows directly used to cut the selected row off).
     const firstIdx = Math.min(top, selectable.length - 1);
     const lastIdx = Math.min(top + height() - 1, selectable.length - 1);
-    if (firstIdx < 0 || lastIdx < 0) { paint([chalk.dim(HINT)]); return; }
+    // TWO-COLUMN geometry shared by every list-ish frame (owner fix: the
+    // sidebar column — separator + panel — must run from the VERY TOP, also
+    // beside the search field rows; never cut where the field begins)
+    const cols = stdout.columns || 80;
+    // owner fix (#38 feedback, round 3): the list keeps ~75% of the terminal.
+    // ⚠ warning rows render in the list column like every other row — at
+    // this width real warnings fit, and the separator stays unbroken.
+    const listWidth = Math.max(44, Math.min(cols - 22, Math.floor(cols * 0.85)));
+    const panelWidth = Math.max(10, cols - listWidth - 3);
+    const panelLines = buildPanel(panelInfo, { width: panelWidth, focusButton: focus === 'buttons' ? buttonIdx : -1 });
+    const composeRow = (left, i) => `${padCell(left, listWidth)}${chalk.dim(' │ ')}${panelLines[i] || ''}`;
+
+    if (firstIdx < 0 || lastIdx < 0) {
+      // no selectable rows — during a search that is "no matches": the field
+      // STAYS visible so typing can continue, the hint stays pinned and the
+      // note echoes the query (never a bare empty screen) — and the sidebar
+      // column still runs beside the field
+      if (search) {
+        const fieldLines = buildSearchField(search, searchFieldWidth(cols));
+        const lines = [];
+        for (let i = 0; i < Math.max(fieldLines.length, panelLines.length); i += 1) {
+          lines.push(composeRow(fieldLines[i] || '', i));
+        }
+        lines.push('', chalk.yellow(`no tools match "${search.query}"`), chalk.dim('backspace edits the query · esc leaves the field'));
+        paint(lines, true);
+      } else {
+        paint([chalk.dim(HINT)]);
+      }
+      return;
+    }
     const first = selectable[firstIdx].rowIndex;
     // when the window reaches the LAST selectable row, show everything below
     // it too — a warning row under the final group must stay visible
@@ -317,28 +455,34 @@ function createToolsApp({ scan, stdout, stdin, onExit, viewportRows, toolInfo: t
       : selectable[lastIdx].rowIndex + 1;
     const listLines = rows.slice(first, stop);
 
-    // TWO-COLUMN FRAME: list window left, side panel right. The panel is
-    // frame-height independent — it starts at the tool name regardless of
-    // where the list window sits.
-    const cols = stdout.columns || 80;
-    // owner fix (#38 feedback, round 3): the list keeps ~75% of the terminal.
-    // ⚠ warning rows render in the list column like every other row — at
-    // this width real warnings fit, and the separator stays unbroken.
-    const listWidth = Math.max(44, Math.min(cols - 22, Math.floor(cols * 0.85)));
-    const panelWidth = Math.max(10, cols - listWidth - 3);
-    const panelLines = buildPanel(panelInfo, { width: panelWidth, focusButton: focus === 'buttons' ? buttonIdx : -1 });
-    const height2 = Math.max(listLines.length, panelLines.length);
+    const height2 = Math.max(listLines.length + FIELD_ROWS, panelLines.length);
     const composed = [];
+    // the search field (issue #41) is ALWAYS visible: a round-bordered box in
+    // the LIST column — the first 3 rows pair the box with the PANEL so the
+    // sidebar separator runs unbroken from row 1 (idle box = placeholder)
+    const fieldLines = buildSearchField(search, searchFieldWidth(cols));
     for (let i = 0; i < height2; i += 1) {
-      const listLine = listLines[i] || '';
-      composed.push(`${padCell(listLine, listWidth)}${chalk.dim(' │ ')}${panelLines[i] || ''}`);
+      if (i < FIELD_ROWS) { composed.push(composeRow(fieldLines[i] || '', i)); continue; }
+      const listLine = listLines[i - FIELD_ROWS] || '';
+      composed.push(composeRow(listLine, i));
+    }
+    // owner fix: the sidebar column runs the FULL frame height — down to the
+    // pinned hint — and NEVER shrinks when the list has fewer tools; the
+    // filler rows carry just the separator (+ panel continuation if any)
+    const rowsSane = Number.isFinite(stdout.rows) && stdout.rows >= 8 && stdout.rows <= 100;
+    const targetLines = rowsSane ? stdout.rows - 1 : height2;
+    while (composed.length < targetLines) {
+      composed.push(composeRow('', composed.length));
     }
     paint(composed); // the hint is pinned by paint() itself
   };
 
   const move = (delta) => {
     if (!result) return;
-    const { selectable } = buildView(result, cursor.selected, collapsed);
+    // ↑ past the very top of the list → the focus moves INTO the search
+    // field (owner: the cursor must land in the box, never hover+field at once)
+    if (delta < 0 && cursor.selected === 0) { openSearch(); return; }
+    const { selectable } = buildView(viewResult(), cursor.selected, collapsed);
     const len = selectable.length;
     setCursor(({ selected: s, top: t }) => {
       const next = clampIdx(s + delta, len);
@@ -351,12 +495,12 @@ function createToolsApp({ scan, stdout, stdin, onExit, viewportRows, toolInfo: t
 
   const toggle = () => {
     if (!result) return;
-    const { selectable } = buildView(result, cursor.selected, collapsed);
+    const { selectable } = buildView(viewResult(), cursor.selected, collapsed);
     const row = selectable[cursor.selected];
     if (!row || row.type !== 'header') return;
     if (collapsed.has(row.id)) collapsed.delete(row.id);
     else collapsed.add(row.id);
-    const len = buildView(result, cursor.selected, collapsed).selectable.length;
+    const len = buildView(viewResult(), cursor.selected, collapsed).selectable.length;
     setCursor(({ selected: s, top: t }) => ({
       selected: clampIdx(s, len),
       top: Math.min(t, Math.max(0, len - height())),
@@ -369,7 +513,7 @@ function createToolsApp({ scan, stdout, stdin, onExit, viewportRows, toolInfo: t
   const refreshPanel = () => {
     panelInfo = null;
     if (!result) return;
-    const { selectable } = buildView(result, cursor.selected, collapsed);
+    const { selectable } = buildView(viewResult(), cursor.selected, collapsed);
     const row = selectable[cursor.selected];
     if (row && row.type === 'tool') {
       const entry = result.entries.find(e => e.id === row.id);
@@ -405,6 +549,7 @@ function createToolsApp({ scan, stdout, stdin, onExit, viewportRows, toolInfo: t
     cursor = { selected: 0, top: 0 };
     focus = 'list';
     buttonIdx = 0;
+    search = null; // a fresh scan starts unfiltered
     if (frameTimer) { clearInterval(frameTimer); frameTimer = null; }
     refreshPanel(); // fresh scan → selection on a header → placeholder panel
     render();
@@ -421,6 +566,7 @@ function createToolsApp({ scan, stdout, stdin, onExit, viewportRows, toolInfo: t
     cursor = { selected: 0, top: 0 };
     focus = 'list';
     buttonIdx = 0;
+    search = null;
     startLoader();
     render();
     Promise.resolve()
@@ -603,9 +749,84 @@ function createToolsApp({ scan, stdout, stdin, onExit, viewportRows, toolInfo: t
 
   const dismissAction = () => { clearDoneTimer(); actionState = null; render(); };
 
+  // ── search field (/ key, issue #41) ─────────────────────────────────────
+  // The field is a PERSISTENT search bar (owner round 4): the query and the
+  // filtered view SURVIVE leaving the field — Esc/Enter/↓ only move the
+  // focus (the cursor hides, the hover returns on the best match). The list
+  // returns to ALL tools only when the query is emptied (or on a rescan).
+  const openSearch = () => {
+    if (search) { search.focused = true; render(); return; }
+    search = { query: '', pos: 0, focused: true };
+    render();
+  };
+
+  const setQuery = (q, pos = q.length) => {
+    search.query = q;
+    search.pos = Math.max(0, Math.min(pos, q.length));
+    // restart at the BEST MATCH — the first TOOL row of the filtered view
+    // (headers are context; Enter on a search result must confirm a tool)
+    let first = 0;
+    if (q && result) {
+      const { selectable } = buildView(viewResult(), 0, collapsed);
+      const idx = selectable.findIndex(r => r.type === 'tool');
+      if (idx >= 0) first = idx;
+    }
+    cursor = { selected: first, top: 0 };
+    refreshPanel();
+    render();
+  };
+
+  // leave the field WITHOUT resetting: the query and the filter stay, so the
+  // cursor keeps its FILTERED coordinates — just clamp and hand the focus to
+  // the list (the hover lands on the row highlighted inside the field)
+  const unfocusField = () => {
+    if (!search) return;
+    search.focused = false;
+    const { selectable } = buildView(viewResult(), cursor.selected, collapsed);
+    cursor.selected = clampIdx(cursor.selected, selectable.length);
+    cursor.top = Math.min(cursor.top, cursor.selected);
+    refreshPanel();
+    render();
+  };
+
   const onData = (chunk) => {
     if (dead) return;
     const key = parseKey(chunk);
+    // THE SEARCH FIELD first: while it owns the focus every keystroke types
+    // ('q' included — only Ctrl+C exits). Esc/Enter/↓ hand the focus back to
+    // the list WITHOUT resetting the query or the filter.
+    if (search && search.focused) {
+      if (key.ctrlC) {
+        stop();
+        if (onExit) onExit();
+        return;
+      }
+      if (key.esc) { unfocusField(); return; }
+      if (key.enter) { unfocusField(); return; }
+      if (key.backspace) {
+        // delete the character BEFORE the insertion point
+        if (search.pos > 0) setQuery(search.query.slice(0, search.pos - 1) + search.query.slice(search.pos), search.pos - 1);
+        return;
+      }
+      if (key.del) {
+        // delete the character AT the insertion point
+        if (search.pos < search.query.length) setQuery(search.query.slice(0, search.pos) + search.query.slice(search.pos + 1), search.pos);
+        return;
+      }
+      if (key.left) { search.pos = Math.max(0, search.pos - 1); render(); return; }
+      if (key.right) { search.pos = Math.min(search.query.length, search.pos + 1); render(); return; }
+      // the field IS the top — ↑ stays; ↓ hands the focus back to the list
+      // (hover reappears on the best match, the cursor leaves the field)
+      if (key.up) return;
+      if (key.down) { unfocusField(); return; }
+      if (key.f5 || key.shiftR) { rescan(); return; } // rescan clears the field
+      if (key.printable) {
+        const ins = String(chunk); // paste-safe: multi-char chunks insert whole
+        setQuery(search.query.slice(0, search.pos) + ins + search.query.slice(search.pos), search.pos + ins.length);
+        return;
+      }
+      return; // any other control sequence is swallowed while typing
+    }
     if (key.q || key.ctrlC) {
       stop();
       if (onExit) onExit();
@@ -663,6 +884,8 @@ function createToolsApp({ scan, stdout, stdin, onExit, viewportRows, toolInfo: t
       if (focus === 'buttons') { focus = 'list'; render(); }
     } else if (key.u) {
       tryUpdate();
+    } else if (key.slash) {
+      openSearch();
     } else if (key.r) {
       openRemoveDialog();
     } else if (key.f) {
@@ -753,4 +976,4 @@ async function runToolsTui(opts = {}) {
   return 0;
 }
 
-module.exports = { createToolsApp, runToolsTui, buildView, buildPanel, buildDialog, buildActionFrame, buildMinSizeScreen };
+module.exports = { createToolsApp, runToolsTui, buildView, buildPanel, buildDialog, buildActionFrame, buildMinSizeScreen, fuzzyMatch, filterTools };
