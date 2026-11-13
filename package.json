@@ -44,6 +44,6 @@
     "ora": "^5.4.1"
   },
   "devDependencies": {
-    "jest": "^29.6.0"
+    "jest": "^30.5.2"
   }
 }
