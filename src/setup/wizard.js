@@ -1,9 +1,12 @@
 const chalk = require('chalk');
 const { loadCatalog, getToolsByCategories } = require('./catalog');
 const { detectEnvironment } = require('../platform');
+const { probeManagers } = require('../platform/manager-probe');
 const { buildToolPlan, withFallbackRoute } = require('../pkg/builders');
 const { isInstalled, executeInstall } = require('../install/executor');
 const { renderResults } = require('../install/report');
+const { createConsentSession, MANAGER_PROVIDERS, METHOD_MANAGERS, orderByDependencies } = require('../install/consent');
+const { HOMEBREW_INSTALL } = require('../install/hints');
 const { appendInstalled } = require('./registry');
 const { runGitStep } = require('./git-step');
 const { readConfig } = require('../config');
@@ -93,6 +96,7 @@ async function runWizard(opts = {}) {
     configDir,
     stdout = process.stdout,
     env: envOverride, // injectable for tests (defaults to real detection)
+    probeManagers: probeInject, // injectable one-shot availability probe (tests)
   } = opts;
 
   // Ctrl+C in a prompt → graceful exit, exit code 0.
@@ -118,7 +122,13 @@ async function runWizard(opts = {}) {
   const prepStart = Date.now();
   const prep = spinnerFactory('Preparing...');
   prep.start();
-  const env = envOverride || detectEnvironment();
+  // Real manager detection (#43): ONE availability probe per run, then
+  // detection by native-priority selection. An injected probe wins; tests
+  // with only envOverride skip the probe (the override IS the environment).
+  const availability = probeInject
+    ? probeInject()
+    : (envOverride ? null : probeManagers());
+  const env = envOverride || detectEnvironment(availability ? { managerAvailability: availability } : {});
   const catalog = loadCatalog();
   let declinedBefore = false;
   try {
@@ -188,10 +198,111 @@ async function runWizard(opts = {}) {
       return entry;
     });
 
-  // ── split picks: runnable vs. guidance-only ─────────────────────
+  // ── missing managers: consent engine (PRD #42, C2) ──────────────
+  // Picking the provider tool in the wizard (e.g. Node.js) = consent for
+  // this run; otherwise ONE question per manager per run; everything stays
+  // in memory — consents are never persisted.
+  const consent = createConsentSession({
+    interactive: true,
+    consentedManagers: Object.entries(MANAGER_PROVIDERS)
+      .filter(([, p]) => (selectedIds || []).includes(p.tool))
+      .map(([m]) => m),
+    confirm: async message => confirm({
+      message,
+      defaultValue: false,
+      answerLine: ok => ok
+        ? `${chalk.green('✓')} OK — it will be installed first.`
+        : `${chalk.yellow('❗')} Declined — affected tools are marked ✗ in the report.`,
+    }),
+  });
+
+  const declinedResults = [];
+  const declinedIds = new Set();
   const manualResults = [];
   const runnable = [];
+
+  // Distro without a recognized manager: ONE clean notice at the start,
+  // never an error avalanche per tool (PRD #42 story 9).
+  if (toInstall.some(e => e.status === 'manual' && e.managerMissing)) {
+    const where = env.distro ? `${env.os} (${env.distro})` : env.os;
+    log(`⚠ No supported package manager was detected on ${where}.`);
+    log(`  System tools are listed as manual — install one of: apt, dnf, pacman, zypper, apk (Linux) · brew (macOS) · winget, choco, scoop (Windows).`);
+    log('');
+  }
+
+  // macOS without brew: ONE Homebrew question BEFORE anything installs
+  // (PRD #42 stories 8/17). After consent the system tools plan through
+  // brew, with the Homebrew tool itself (catalog, universal) going first.
+  const byIdAll = new Map(loadCatalog().flatMap(c => c.tools.map(t => [t.id, { ...t, category: c.id }])));
+  const brewEntries = toInstall.filter(e => e.status === 'manual' && e.requiresManager === 'brew');
+  const brewReplans = new Map();
+  if (brewEntries.length > 0) {
+    const names = brewEntries.map(e => e.name).join(', ');
+    const decision = await consent.resolve(names, 'brew',
+      `Homebrew is not installed — the picked system tools (${names}) need it. Install Homebrew first?`);
+    if (decision.action === 'approved') {
+      const brewEnv = { ...env, manager: 'brew' };
+      const hbTool = byIdAll.get('homebrew');
+      if (hbTool) {
+        runnable.push({ id: hbTool.id, name: hbTool.name, category: hbTool.category, method: hbTool.installMethod, force: false, ...buildToolPlan(hbTool, brewEnv) });
+      }
+      for (const e of brewEntries) {
+        const tool = byIdAll.get(e.id);
+        if (tool) {
+          brewReplans.set(e.id, { id: e.id, name: e.name, category: e.category, method: tool.installMethod, force: e.force, ...buildToolPlan(tool, brewEnv) });
+        }
+      }
+    } else {
+      for (const e of brewEntries) {
+        declinedIds.add(e.id);
+        declinedResults.push({
+          id: e.id, name: e.name, category: e.category, method: e.method,
+          status: 'failed', error: decision.reason,
+          hint: `${decision.hint}\nOfficial installer: ${HOMEBREW_INSTALL}`,
+        });
+      }
+    }
+  }
+
+  // Missing ecosystem managers (npm/pip/cargo/go/gem/composer/dotnet):
+  // consent per manager — marked provider = consent, otherwise one question
+  // per run; declined → ✗ with reason + hint, the rest installs normally.
+  const ecoConsented = new Set();
   for (const entry of toInstall) {
+    if (entry.status !== 'planned' || brewReplans.has(entry.id)) continue;
+    const mgr = METHOD_MANAGERS[entry.method];
+    if (!mgr || !availability || availability[mgr] !== false) continue;
+    const decision = await consent.resolve(entry.name, mgr);
+    if (decision.action === 'approved') {
+      ecoConsented.add(mgr);
+    } else {
+      declinedIds.add(entry.id);
+      declinedResults.push({
+        id: entry.id, name: entry.name, category: entry.category, method: entry.method,
+        status: 'failed', error: decision.reason, hint: decision.hint,
+      });
+    }
+  }
+
+  // Managers approved via question get their provider entry injected (the
+  // provider tool was not picked explicitly); the ordering pass below puts
+  // it before the tools that need it.
+  for (const mgr of ecoConsented) {
+    const provider = MANAGER_PROVIDERS[mgr];
+    if (!provider || (selectedIds || []).includes(provider.tool)) continue;
+    const tool = byIdAll.get(provider.tool);
+    if (tool) {
+      runnable.push({ id: tool.id, name: tool.name, category: tool.category, method: tool.installMethod, force: false, ...buildToolPlan(tool, env) });
+    }
+  }
+
+  // ── split picks: runnable vs. declined vs. guidance-only ────────
+  for (const entry of toInstall) {
+    if (brewReplans.has(entry.id)) {
+      runnable.push(brewReplans.get(entry.id));
+      continue;
+    }
+    if (declinedIds.has(entry.id)) continue;
     if (entry.status === 'manual') {
       manualResults.push({
         id: entry.id, name: entry.name, category: entry.category, method: entry.method,
@@ -206,6 +317,11 @@ async function runWizard(opts = {}) {
       runnable.push(entry);
     }
   }
+
+  // Execution order (PRD #42 rule 5): a manager install precedes the tools
+  // that require it — Node before yarn/typescript. Stable: within the same
+  // depth the pick order stands.
+  orderByDependencies(runnable);
 
   // ── Windows runtime question (HITL finding, 0.3.0) ──────────────
   // ADM always runs under Node. On Windows, installing Node.js spawns an
@@ -245,10 +361,10 @@ async function runWizard(opts = {}) {
 
   let gitOffered = false;
 
-  if (runnable.length === 0 && manualResults.length === 0) {
+  if (runnable.length === 0 && manualResults.length === 0 && declinedResults.length === 0) {
     log('Nothing selected — nothing to do.');
   } else {
-    let results = manualResults;
+    let results = [...declinedResults, ...manualResults];
     let workedLine = null;
 
     if (runnable.length > 0) {
@@ -265,6 +381,7 @@ async function runWizard(opts = {}) {
         execFunc,
         home,
         rcFile: env.rcFile,
+        env: envOverride, // tests: keep the in-process PATH refresh off process.env
         onStart: ({ tool }) => {
           if (spinner) spinner.stop();
           // owner decision: ONE install line at a time — the previous
@@ -294,7 +411,7 @@ async function runWizard(opts = {}) {
           return { ...r, status: 'reinstalled' };
         }
         return r;
-      }), ...manualResults];
+      }), ...declinedResults, ...manualResults];
 
       // The git-identity question belongs to a git/gh FRESH install — a
       // reinstall means the user already has it configured.

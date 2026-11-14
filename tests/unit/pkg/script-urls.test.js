@@ -44,10 +44,14 @@ describe('script URL resolver — per OS×arch', () => {
 
   test('no POSIX /bin/bash hardcoding anywhere in generated commands', () => {
     const { SCRIPTS } = require('../../../src/pkg/script-urls');
+    // homebrew is exempt: its OFFICIAL installer line is
+    // /bin/bash -c "$(curl -fsSL …)" — the upstream script is bash-only,
+    // so this is the documented official command, not a portability hardcode.
+    const BASH_OFFICIAL = new Set(['homebrew']);
     for (const [id, table] of Object.entries(SCRIPTS)) {
       for (const [pair, fn] of Object.entries(table)) {
         const r = fn();
-        if (r.run) {
+        if (r.run && !BASH_OFFICIAL.has(id)) {
           expect({ id, pair, run: r.run }).toEqual(
             expect.objectContaining({ run: expect.not.stringContaining('/bin/bash') }),
           );

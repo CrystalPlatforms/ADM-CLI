@@ -312,7 +312,8 @@
         { "id": "checkov", "name": "Checkov", "installMethod": "pip" },
         { "id": "trivy", "name": "Trivy", "installMethod": "brew" },
         { "id": "snyk", "name": "Snyk", "installMethod": "npm" },
-        { "id": "sonarqube", "name": "SonarQube Scanner", "installMethod": "brew" }
+        { "id": "sonarqube", "name": "SonarQube Scanner", "installMethod": "brew" },
+        { "id": "homebrew", "name": "Homebrew", "installMethod": "script" }
       ]
     },
     {

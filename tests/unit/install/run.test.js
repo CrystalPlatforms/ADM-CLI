@@ -41,6 +41,7 @@ describe('runInstall', () => {
       err: () => {},
       execFunc,
       platform: 'linux',
+      probeManagers: () => ({ apt: true, npm: true }), // deterministic availability (#43)
       configDir,
       env: { PATH: '/usr/bin:/bin' }, // keep the refresh off the test process
       fs: { accessSync: p => { if (String(p).includes('.npm-global')) return; throw new Error('missing'); } },

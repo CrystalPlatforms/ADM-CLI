@@ -98,6 +98,15 @@ async function resolveBinDirs(entry, opts = {}) {
     try { fs.accessSync(dir); push(dir); } catch { /* not created — skip */ }
   }
 
+  if (entry.id === 'homebrew') {
+    // Homebrew does NOT land in ~/.local/bin (the script-method default) —
+    // without these dirs the SAME run could not call brew for the system
+    // tools the user just consented to (#43).
+    for (const c of ['/opt/homebrew/bin', '/usr/local/bin', '/home/linuxbrew/.linuxbrew/bin']) {
+      try { fs.accessSync(c); push(c); } catch { /* not created — skip */ }
+    }
+  }
+
   if (entry.method === 'nvm') {
     const res = await shExec('. "$HOME/.nvm/nvm.sh" && nvm which current', {
       execFunc: opts.execFunc, shell: 'sh',

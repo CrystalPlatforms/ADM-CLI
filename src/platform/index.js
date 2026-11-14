@@ -3,6 +3,7 @@ const path = require('path');
 const os = require('os');
 const { parseOsRelease } = require('./os-release');
 const { detectShell, rcFileFor } = require('./shell');
+const { selectManager } = require('./manager-probe');
 
 // Maps a distro id (or an id from ID_LIKE) to its default package manager.
 const DISTRO_MANAGERS = {
@@ -98,6 +99,14 @@ function detectEnvironment(opts = {}) {
     manager = 'winget';
   }
 
+  // Real detection (#43): when a one-shot availability probe was provided,
+  // the manager is the first NATIVE candidate that actually exists — not the
+  // platform default. Without the map the legacy assumption stands (adm
+  // config display, tools TUI and legacy tests keep working unchanged).
+  if (opts.managerAvailability) {
+    manager = selectManager({ platform, distroManager: manager, availability: opts.managerAvailability });
+  }
+
   const shell = detectShell({ env, platform, readParentName: opts.readParentName, readPpid: opts.readPpid, ppid: opts.ppid });
 
   return {
@@ -126,4 +135,12 @@ function formatEnvironment(env) {
   return lines.join('\n');
 }
 
-module.exports = { detectEnvironment, formatEnvironment, normalizeArch, DISTRO_MANAGERS };
+module.exports = {
+  detectEnvironment,
+  formatEnvironment,
+  normalizeArch,
+  DISTRO_MANAGERS,
+  selectManager,
+  managerCandidates: require('./manager-probe').managerCandidates,
+  probeManagers: require('./manager-probe').probeManagers,
+};

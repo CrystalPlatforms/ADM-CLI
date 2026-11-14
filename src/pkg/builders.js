@@ -163,7 +163,9 @@ function buildToolPlan(tool, env, opts = {}) {
       const resolved = resolveScript(id, env.os, env.arch);
       if (resolved.manual) return { status: 'manual', reason: resolved.manual };
       // `shell: 'powershell'` propagates to the executor (Windows-only scripts).
-      return planned({ command: resolved.run, package: resolved.url, shell: resolved.shell });
+      // statusProbe overrides the generic `command -v <id>` check when the
+      // installed binary name differs (Homebrew: `brew --version`).
+      return planned({ command: resolved.run, package: resolved.url, shell: resolved.shell, statusSource: resolved.statusProbe });
     }
 
     case 'link':
@@ -176,7 +178,15 @@ function buildToolPlan(tool, env, opts = {}) {
       const resolved = resolvePackageName(id, env.manager);
       if (resolved.manual) return { status: 'manual', reason: resolved.manual };
       const command = installCommand(env.manager, resolved.name);
-      if (!command) return { status: 'manual', reason: `no package manager detected on ${env.os} — install ${id} manually` };
+      if (!command) {
+        // No manager available (real detection, #43). Structured flags let
+        // the wizard/plan drive the Homebrew question or the clean
+        // "no supported manager" notice instead of a per-tool error avalanche.
+        if (env.os === 'darwin') {
+          return { status: 'manual', reason: 'requires Homebrew, which is not installed', requiresManager: 'brew' };
+        }
+        return { status: 'manual', reason: `no supported package manager detected on ${env.os} — install ${id} manually`, managerMissing: true };
+      }
       return planned({ command, manager: env.manager, package: resolved.name });
     }
   }

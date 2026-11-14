@@ -95,7 +95,16 @@ describe('manual and missing-manager handling', () => {
     const noManager = { ...ENVS.linux, manager: 'none' };
     const plan = buildToolPlan({ id: 'jq', installMethod: 'brew' }, noManager);
     expect(plan.status).toBe('manual');
-    expect(plan.reason).toContain('no package manager');
+    expect(plan.reason).toContain('no supported package manager');
+    expect(plan.managerMissing).toBe(true);
+  });
+
+  test('darwin without brew → manual flagged requiresManager: brew (#43)', () => {
+    const noBrew = { ...ENVS.darwin, manager: 'none' };
+    const plan = buildToolPlan({ id: 'jq', installMethod: 'brew' }, noBrew);
+    expect(plan.status).toBe('manual');
+    expect(plan.requiresManager).toBe('brew');
+    expect(plan.reason).toContain('Homebrew');
   });
 
   test('planned entries carry a status source', () => {

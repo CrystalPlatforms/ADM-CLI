@@ -83,6 +83,16 @@ const SCRIPTS = {
     'win32-x64': () => ({ manual: 'install bazelisk via choco: choco install bazelisk' }),
     'win32-arm64': () => ({ manual: 'install bazelisk via choco: choco install bazelisk' }),
   },
+  // Homebrew as a regular catalog tool (PRD #42, C3 — macOS and Linux; the
+  // official install script; status probed via `brew --version`).
+  homebrew: {
+    'darwin-x64': () => ({ url: 'https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh', run: '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"', statusProbe: 'brew --version' }),
+    'darwin-arm64': () => ({ url: 'https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh', run: '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"', statusProbe: 'brew --version' }),
+    'linux-x64': () => ({ url: 'https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh', run: '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"', statusProbe: 'brew --version' }),
+    'linux-arm64': () => ({ url: 'https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh', run: '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"', statusProbe: 'brew --version' }),
+    'win32-x64': () => ({ manual: 'Homebrew does not support Windows' }),
+    'win32-arm64': () => ({ manual: 'Homebrew does not support Windows' }),
+  },
 };
 
 // resolveScript(id, os, arch) → { url, run, shell? } | { manual }

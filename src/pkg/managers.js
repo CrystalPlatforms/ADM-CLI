@@ -18,11 +18,9 @@ const MANAGERS = {
 
 const SUPPORTED_MANAGERS = Object.keys(MANAGERS);
 
-// Checks whether the manager's binary exists in PATH. Pure fs walk — no exec,
-// fast enough for dry-run planning, deterministic and testable via env override.
-function isManagerAvailable(name, opts = {}) {
-  const def = MANAGERS[name];
-  if (!def) return false;
+// PATH walk for a single binary name. Pure fs — no exec, fast enough for
+// dry-run planning, deterministic and testable via env override.
+function binaryAvailable(binName, opts = {}) {
   const env = opts.env || process.env;
   const platform = opts.platform || process.platform;
   const statSync = opts.statSync || fs.statSync;
@@ -36,7 +34,7 @@ function isManagerAvailable(name, opts = {}) {
 
   for (const dir of dirs) {
     for (const ext of exts) {
-      const candidate = `${dir}${path.sep}${def.bin}${ext}`;
+      const candidate = `${dir}${path.sep}${binName}${ext}`;
       try {
         statSync(candidate);
         accessSync(candidate);
@@ -49,6 +47,13 @@ function isManagerAvailable(name, opts = {}) {
   return false;
 }
 
+// Checks whether the manager's binary exists in PATH (delegates to the walk).
+function isManagerAvailable(name, opts = {}) {
+  const def = MANAGERS[name];
+  if (!def) return false;
+  return binaryAvailable(def.bin, opts);
+}
+
 // Install command for a manager + package name, or null for unknown manager.
 function installCommand(manager, pkgName) {
   const def = MANAGERS[manager];
@@ -56,4 +61,4 @@ function installCommand(manager, pkgName) {
   return def.install(pkgName);
 }
 
-module.exports = { MANAGERS, SUPPORTED_MANAGERS, isManagerAvailable, installCommand };
+module.exports = { MANAGERS, SUPPORTED_MANAGERS, binaryAvailable, isManagerAvailable, installCommand };
